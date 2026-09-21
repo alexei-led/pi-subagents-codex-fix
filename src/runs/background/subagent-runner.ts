@@ -1874,6 +1874,7 @@ export async function runSubagent(
 	config = { ...config, effectiveExecutionLifetime: lifetime.effectiveExecutionLifetime, timeoutMs: lifetime.timeoutMs, deadlineAt: lifetime.timeoutMs === undefined ? undefined : config.deadlineAt ?? Date.now() + lifetime.timeoutMs };
 	if (config.executionLifetime !== undefined) {
 		for (const step of flattenSteps(config.steps)) {
+			step.executionLifetime ??= config.executionLifetime;
 			const stepLifetime = resolveExecutionLifetime(step.executionLifetime ?? config.executionLifetime, step.timeoutMs);
 			if (stepLifetime.error) throw new Error(stepLifetime.error);
 			step.timeoutMs = stepLifetime.timeoutMs;

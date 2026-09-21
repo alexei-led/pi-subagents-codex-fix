@@ -1132,6 +1132,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, s.toolBudget ? "toolBudget" : a.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 		if (resolvedToolBudget.error) throw new AsyncStartValidationError(resolvedToolBudget.error);
 		const resolvedToolTimeout = resolveToolTimeoutMs({
+			executionLifetime: s.executionLifetime ?? params.executionLifetime,
 			callValue: params.callToolTimeoutMs,
 			agentValue: a.defaultToolTimeoutMs,
 			configValue: params.configToolTimeoutMs,
@@ -2011,6 +2012,7 @@ export function executeAsyncSingle(
 		: lifetime.timeoutMs;
 	if (timeoutMs !== undefined && timeoutMs <= 0) return formatAsyncStartError("single", "The source run's absolute deadline expired before recovery could launch.");
 	const resolvedToolTimeout = resolveToolTimeoutMs({
+		executionLifetime: params.executionLifetime,
 		callValue: params.toolTimeoutMs,
 		agentValue: agentConfig.defaultToolTimeoutMs,
 		configValue: params.configToolTimeoutMs,

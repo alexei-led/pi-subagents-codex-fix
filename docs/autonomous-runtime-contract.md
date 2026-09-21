@@ -13,6 +13,9 @@ workflow children, detached runners, nested Pi children, and recovery descriptor
 An omitted field preserves existing agent/configuration/default timeout behavior.
 Explicit bounded timeouts must be positive integers within Node's timer range.
 Control requests and explicitly budgeted host commands retain their own timeouts.
+Explicit unbounded mode also suppresses built-in, agent, configuration, and
+environment tool-timeout defaults. A deliberate `toolTimeoutMs` on the launch
+call remains an explicit command budget; control RPC timeouts remain bounded.
 
 RPC `ping` advertises `executionLifetime: { version: 1, modes: ["unbounded",
 "bounded"] }`, `durableOperations: { version: 1, lookup: true, replay: true,
