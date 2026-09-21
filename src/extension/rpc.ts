@@ -733,6 +733,7 @@ function stopAsyncRun(
 
 const operationIdentityValidator = Compile(Type.Object({ operationId: Type.String({ minLength: 1, maxLength: 512, pattern: "^[^\\r\\n]+$" }), digest: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), cwd: Type.Optional(Type.String()) }));
 const operationResponseValidator = Compile(Type.Object({ text: Type.Optional(Type.String()), details: Type.Optional(Type.Object({ asyncDir: Type.Optional(Type.String()) })), isError: Type.Optional(Type.Boolean()) }));
+const admissionRejectionValidator = Compile(Type.Object({ version: Type.Literal(1), state: Type.Literal("rejected-before-dispatch"), runId: Type.String(), reason: Type.Literal("agent-resolution-rejected") }));
 const diagnosticValidator = Compile(Type.Object({ diagnosticId: Type.String({ minLength: 1, maxLength: 256 }), toolCallId: Type.String({ minLength: 1, maxLength: 512 }), message: Type.String({ minLength: 1, maxLength: 4096 }) }));
 const diagnosticReceiptValidator = Compile(Type.Object({ state: Type.Union([Type.Literal("queued"), Type.Literal("cancelled"), Type.Literal("rejected")]), reason: Type.Optional(Type.String()) }));
 
@@ -774,7 +775,7 @@ async function observeOperation(operation: DurableOperation, options: RegisterSu
 		state: cancellationRequested ? "cancelled" : response || status ? "found" : "pending",
 		safeToReplay: true,
 		cancellationRequested,
-		neverStarted: intent.kind === "cancel" || kernel?.neverStarted === true,
+		neverStarted: intent.kind === "cancel" || operation.rejectedBeforeDispatch() || kernel?.neverStarted === true,
 		effectiveExecutionLifetime: intent.effectiveExecutionLifetime,
 		effectiveExecutionOwnership: intent.effectiveExecutionOwnership,
 		executionRoute: intent.executionRoute,
@@ -818,6 +819,7 @@ function stopOwnedRunTree(runId: string, asyncDir: string, sessionId: string | u
 async function stopOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext): Promise<void> {
 	const intent = operation.intent();
 	if (!intent || intent.kind === "cancel") return;
+	if (operation.rejectedBeforeDispatch()) return;
 	if (intent.effectiveExecutionOwnership?.mode === "kernel") {
 		const ownedDirectory = path.join(operation.directory, "owned");
 		const mapping = readNativeKernelMapping(ownedDirectory, intent.runId);
@@ -910,6 +912,7 @@ async function handleOperation(
 	activeOperations.set(operation.directory, controller);
 	try {
 		const result = await options.execute(`rpc-spawn-${request.requestId}`, { ...params, rpcOperationRunId: operation.runId, rpcKernelOperationDirectory: path.join(operation.directory, "owned") }, controller.signal, undefined, ctx);
+		if (result.isError && admissionRejectionValidator.Check(result.details?.admission) && result.details.admission.runId === operation.runId) operation.rejectBeforeDispatch(operation.runId, result.details.admission.reason);
 		operation.complete(dataFromToolResult(result));
 		if (operation.cancelled()) await stopOperation(operation, options, ctx);
 		return observeOperation(operation, options);

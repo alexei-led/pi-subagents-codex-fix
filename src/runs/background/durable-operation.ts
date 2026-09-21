@@ -9,6 +9,8 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string
 interface OperationResult { text: string; details?: Details; isError?: boolean }
 export interface DiagnosticIntent { diagnosticId: string; toolCallId: string; message: string }
 interface DiagnosticReceipt { state: "queued" | "cancelled" | "rejected"; reason?: string }
+interface AdmissionRejection extends OperationIdentity { version: 1; runId: string; requestHash: string; reason: "agent-resolution-rejected" }
+const admissionRejectionValidator = Compile(Type.Object({ version: Type.Literal(1), operationId: Type.String(), digest: Type.String(), runId: Type.String(), requestHash: Type.String(), reason: Type.Literal("agent-resolution-rejected") }));
 interface OperationAnchor extends OperationIdentity { version: 1; scope: string; scopeCwd?: string; kind: "launch" | "cancel"; requestHash?: string }
 const anchorValidator = Compile(Type.Object({ version: Type.Literal(1), operationId: Type.String(), digest: Type.String(), scope: Type.String({ pattern: "^[a-f0-9]{64}$" }), scopeCwd: Type.Optional(Type.String()), kind: Type.Union([Type.Literal("launch"), Type.Literal("cancel")]), requestHash: Type.Optional(Type.String()) }));
 
@@ -62,7 +64,7 @@ export function operationRequestHash(params: import("../foreground/subagent-exec
 }
 
 /** An immutable, fsynced file published without replacing a concurrent winner. */
-function publishOnce(file: string, value: OperationIntent | OperationIdentity | OperationResult | DiagnosticIntent | DiagnosticReceipt | OperationAnchor): boolean {
+function publishOnce(file: string, value: OperationIntent | OperationIdentity | OperationResult | DiagnosticIntent | DiagnosticReceipt | OperationAnchor | AdmissionRejection): boolean {
 	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
 	const temporary = `${file}.${randomUUID()}.tmp`;
 	const fd = fs.openSync(temporary, "wx", 0o600);
@@ -180,6 +182,20 @@ export class DurableOperation {
 
 	result(): JsonValue | undefined { return read(path.join(this.directory, "result.json")); }
 	complete(result: OperationResult): void { publishOnce(path.join(this.directory, "result.json"), result); }
+
+	rejectBeforeDispatch(runId: string, reason: "agent-resolution-rejected"): void {
+		const intent = this.intent();
+		if (!intent || intent.kind !== "launch" || intent.runId !== runId || !intent.requestHash) throw new Error("Pre-dispatch rejection does not match its launch claim.");
+		publishOnce(path.join(this.directory, "admission-rejected.json"), { version: 1, operationId: intent.operationId, digest: intent.digest, runId, requestHash: intent.requestHash, reason });
+	}
+
+	rejectedBeforeDispatch(): boolean {
+		const receipt = read(path.join(this.directory, "admission-rejected.json"));
+		if (receipt === undefined) return false;
+		const intent = this.intent();
+		if (!admissionRejectionValidator.Check(receipt) || !intent || receipt.operationId !== intent.operationId || receipt.digest !== intent.digest || receipt.runId !== intent.runId || receipt.requestHash !== intent.requestHash) throw new Error("Invalid pre-dispatch rejection receipt; ownership is unknown.");
+		return true;
+	}
 
 	claimDiagnostic(intent: DiagnosticIntent): boolean {
 		const file = path.join(this.directory, "diagnostics", hash(intent.diagnosticId), "intent.json");

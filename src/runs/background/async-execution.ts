@@ -1,6 +1,6 @@
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime, ExecutionOwnership, ProcessTerminal } from "../../shared/types.ts";
-import { launchKernelOwnedProcess, prepareKernelOwnedProcess, cancelKernelOwnedProcess, inspectKernelOwnedProcessMembership, type KernelOwnedProcessRequest } from "../../api/kernel-owned-process.mjs";
+import { launchKernelOwnedProcess, prepareKernelOwnedProcess, cancelKernelOwnedProcess, inspectInheritedKernelOwnedProcessMembership, type KernelOwnedProcessRequest } from "../../api/kernel-owned-process.mjs";
 import { observeNativeKernelRun, writeNativeKernelMapping } from "./runtime-ownership.ts";
 import { ownedGitEnvironment } from "../shared/owned-git-environment.ts";
 /**
@@ -747,7 +747,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 	const requestedOwnership = (cfg as { executionOwnership?: ExecutionOwnership }).executionOwnership;
 	const inheritedOperation = process.env.PI_KERNEL_OWNED_OPERATION;
 	if (requestedOwnership?.mode === "kernel" && inheritedOperation && !validatedInheritedLaunches.has(cfg)) {
-		return inspectKernelOwnedProcessMembership(inheritedOperation).then((membership) => {
+		return inspectInheritedKernelOwnedProcessMembership(inheritedOperation).then((membership) => {
 			if (!membership.owned) return { error: `Inherited kernel ownership is invalid: ${membership.reason ?? "current process is outside the recorded coalition"}` };
 			validatedInheritedLaunches.add(cfg);
 			return spawnRunner(cfg, suffix, cwd, initialStatus, initialStatusPath, launchParentSessionId, onProcessTerminal, onBeforeProceed, requestedCwd);

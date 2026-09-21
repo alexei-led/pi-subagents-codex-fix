@@ -3,7 +3,7 @@ import { writeWorkflowDispatchClosed } from "../background/workflow-terminal.ts"
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
 import { randomUUID } from "node:crypto";
-import { inspectKernelOwnedProcessMembership } from "../../api/kernel-owned-process.mjs";
+import { inspectInheritedKernelOwnedProcessMembership } from "../../api/kernel-owned-process.mjs";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -5129,7 +5129,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		if (ownershipError) return buildRequestedModeError(params, ownershipError);
 		let inheritedKernelOwnership = false;
 		if (!params.action && process.env.PI_KERNEL_OWNED_OPERATION) {
-			const membership = await inspectKernelOwnedProcessMembership(process.env.PI_KERNEL_OWNED_OPERATION);
+			const membership = await inspectInheritedKernelOwnedProcessMembership(process.env.PI_KERNEL_OWNED_OPERATION);
 			if (!membership.owned) return buildRequestedModeError(params, `Inherited kernel ownership is invalid: ${membership.reason ?? "process is outside the recorded coalition"}`);
 			inheritedKernelOwnership = true;
 		}
@@ -7020,7 +7020,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const discoveredAgents = discovered.agents;
 		const unknownAgentDiagnosticContext = diagnosticContextFromDiscovery(discovered, effectiveCwd, scope);
 		const canonicalParams = canonicalizeExecutionParams(effectiveParams, discoveredAgents, discovered.agentDiagnostics, unknownAgentDiagnosticContext);
-		if (canonicalParams.error) return buildRequestedModeError(effectiveParams, canonicalParams.error);
+		if (canonicalParams.error) {
+			const rejection = buildRequestedModeError(effectiveParams, canonicalParams.error);
+			if (effectiveParams.rpcOperationRunId) rejection.details.admission = { version: 1, state: "rejected-before-dispatch", runId: effectiveParams.rpcOperationRunId, reason: "agent-resolution-rejected" };
+			return rejection;
+		}
 		effectiveParams = canonicalParams.params!;
 		if (effectiveParams.worktree === undefined && deps.config.worktree !== undefined) {
 			effectiveParams = { ...effectiveParams, worktree: deps.config.worktree };

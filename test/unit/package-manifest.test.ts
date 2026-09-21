@@ -181,6 +181,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(typeof kernel.prepareKernelOwnedProcess, "function");
 	assert.equal(typeof kernel.launchKernelOwnedProcess, "function");
 	assert.equal(kernel.reconcileKernelOwnedProcess.name, "reconcileKernelOwnedProcess");
+	assert.equal(kernel.inspectInheritedKernelOwnedProcessMembership.name, "inspectInheritedKernelOwnedProcessMembership");
 	assert.equal(typeof kernel.inspectKernelOwnedProcessMembership, "function");
 });
 

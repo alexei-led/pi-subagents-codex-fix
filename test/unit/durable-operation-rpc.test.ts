@@ -63,6 +63,28 @@ function request(events: Events, method: SubagentRpcMethod, params: OperationReq
 
 const launch = { operationId: "operation-1", digest: "digest-1", agent: "worker", task: "Work", executionLifetime: { mode: "unbounded" } } satisfies OperationRequest;
 
+for (const kind of ["proven", "unclassified", "foreign-run"] as const) it(`preserves pre-dispatch rejection evidence without replaying the launch (${kind})`, async t => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "durable-rejection-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const events = createEventBus();
+	let executions = 0;
+	const options: Options = { events, asyncDirRoot: root, getContext: () => context(root), execute: async (_id, params) => {
+		executions++;
+		const details: import("../../src/shared/types.ts").Details = { mode: "single", results: [] };
+		if (kind !== "unclassified") details.admission = { version: 1, state: "rejected-before-dispatch", runId: kind === "foreign-run" ? "other-run" : params.rpcOperationRunId!, reason: "agent-resolution-rejected" };
+		return { isError: true, content: [{ type: "text", text: "rejected" }], details };
+	} };
+	const first = registerSubagentRpcBridge(options);
+	await Promise.all([request(events, "spawn", launch), request(events, "spawn", launch)]);
+	first.dispose();
+	const restarted = registerSubagentRpcBridge({ ...options, getContext: () => context(path.join(root, "new-cwd"), "session-2") });
+	t.after(() => restarted.dispose());
+	assert.equal((await request(events, "lookup", launch)).neverStarted, kind === "proven");
+	assert.equal((await request(events, "cancel", launch)).neverStarted, kind === "proven");
+	assert.equal((await request(events, "spawn", launch)).neverStarted, kind === "proven");
+	assert.equal(executions, 1);
+});
+
 it("reconciles a lost spawn reply across session restart without a second dispatch", async () => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "durable-rpc-"));
 	const events = createEventBus();

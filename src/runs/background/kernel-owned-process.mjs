@@ -506,6 +506,23 @@ export async function inspectKernelOwnedProcessMembership(operationDirectory, pi
   }
 }
 
+export async function inspectInheritedKernelOwnedProcessMembership(marker, pid = process.pid) {
+  try {
+    const descriptor = JSON.parse(marker);
+    if (!isRecord(descriptor) || !isString(descriptor.operationDirectory) || !path.isAbsolute(descriptor.operationDirectory))
+      return { owned: false, reason: "inherited-descriptor-invalid" };
+    for (const field of ["operationId", "requestDigest", "hostId", "bootId"])
+      if (!isString(descriptor[field]) || !descriptor[field]) return { owned: false, reason: "inherited-descriptor-invalid" };
+    const membership = await inspectKernelOwnedProcessMembership(descriptor.operationDirectory, pid);
+    if (!membership.owned || !membership.identity) return membership;
+    for (const field of ["operationId", "requestDigest", "hostId", "bootId"])
+      if (descriptor[field] !== membership.identity[field]) return { owned: false, reason: "inherited-binding-mismatch" };
+    return membership;
+  } catch {
+    return { owned: false, reason: "inherited-descriptor-invalid" };
+  }
+}
+
 export async function requestKernelOwnedProcessCancellation(operationDirectory) {
   const directory = path.resolve(operationDirectory);
   ensureDirectory(directory);

@@ -113,3 +113,8 @@ export function inspectKernelOwnedProcessMembership(
   processIdentity?: KernelProcessIdentity;
   reason?: string;
 }>;
+
+export function inspectInheritedKernelOwnedProcessMembership(
+  marker: string,
+  pid?: number,
+): ReturnType<typeof inspectKernelOwnedProcessMembership>;

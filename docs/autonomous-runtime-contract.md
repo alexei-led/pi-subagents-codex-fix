@@ -36,6 +36,11 @@ job providers, and top-level foreground requests are unsupported by this strict
 route. Nested processes inherit the root only after actual kernel membership has
 been verified.
 
+The inherited environment marker is a JSON descriptor containing the operation
+directory and its operation ID, request digest, host ID, and boot ID. Nested
+launches validate every binding field and the current process's actual coalition
+membership before using the existing root.
+
 Strict workers remove inherited Git repository selectors and injected per-command
 configuration before the kernel request is frozen. Author, committer, SSH, and
 authentication settings remain available. The parent environment is unchanged.
@@ -87,6 +92,11 @@ request only. `neverStarted: true` is returned only when cancellation won the
 atomic launch arbitration before dispatch. Otherwise callers must observe exit
 evidence. Repeated lookup/cancel requests retry stop delivery when startup races
 with cancellation.
+
+A root request rejected during agent resolution also records a correlated
+pre-dispatch receipt and reports `neverStarted: true`. The immutable launch claim
+remains consumed, so concurrent or delayed replays cannot dispatch it. Generic
+errors, absent files, and unclassified failures do not imply this evidence.
 
 For kernel-owned launches, observed `processTerminalProof` includes the full
 `processTreeOwnership` descriptor, `nativeOperation: { operationId, digest }`,
