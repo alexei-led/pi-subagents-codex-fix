@@ -11,6 +11,7 @@ import {
 } from "../../shared/types.ts";
 import { canonicalSessionId, inspectSessionLease } from "../shared/session-lease.ts";
 import { releaseActiveRunIndex } from "./active-run-index.ts";
+import { validKernelTerminalProof } from "./runtime-ownership.ts";
 
 export interface ProcessTerminalCandidate {
 	version: 1;
@@ -164,6 +165,10 @@ function validateProof(raw: unknown, asyncDir: string, fallback?: { runId?: stri
 	}
 	if (fallback?.runId && raw.runId !== fallback.runId) throw new Error(`Process-terminal proof in '${asyncDir}' belongs to run '${raw.runId}', expected '${fallback.runId}'.`);
 	if (fallback?.runnerProcessInstanceId && raw.runnerProcessInstanceId !== fallback.runnerProcessInstanceId) throw new Error(`Process-terminal proof in '${asyncDir}' belongs to runner '${raw.runnerProcessInstanceId}', expected '${fallback.runnerProcessInstanceId}'.`);
+	if (raw.kernelProof !== undefined) {
+		if (!validKernelTerminalProof(raw)) throw new Error(`Invalid kernel process-terminal proof in '${asyncDir}'.`);
+		return true;
+	}
 	if (raw.instances !== undefined && (!Array.isArray(raw.instances) || !raw.instances.every((entry) => validProcessInstance(entry)))) {
 		throw new Error(`Invalid process-terminal instances in '${asyncDir}'.`);
 	}

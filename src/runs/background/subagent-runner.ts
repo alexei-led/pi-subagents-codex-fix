@@ -173,6 +173,9 @@ const INTERCOM_DETACH_RECEIPT = "Detached for intercom coordination before task 
 process.env[SUBAGENT_CHILD_ENV] = "1";
 
 export interface SubagentRunConfig {
+	executionOwnership?: import("../../shared/types.ts").ExecutionOwnership;
+	kernelOperationDirectory?: string;
+	ownedWorkflowKeys?: string[];
 	id: string;
 	steps: RunnerStep[];
 	resultPath: string;
@@ -1860,7 +1863,11 @@ export async function runSubagent(
 	if (lifetime.error) throw new Error(lifetime.error);
 	config = { ...config, effectiveExecutionLifetime: lifetime.effectiveExecutionLifetime, timeoutMs: lifetime.timeoutMs, deadlineAt: lifetime.timeoutMs === undefined ? undefined : config.deadlineAt ?? Date.now() + lifetime.timeoutMs };
 	if (config.executionLifetime !== undefined) {
-		for (const step of flattenSteps(config.steps)) step.timeoutMs = lifetime.timeoutMs;
+		for (const step of flattenSteps(config.steps)) {
+			const stepLifetime = resolveExecutionLifetime(step.executionLifetime ?? config.executionLifetime, step.timeoutMs);
+			if (stepLifetime.error) throw new Error(stepLifetime.error);
+			step.timeoutMs = stepLifetime.timeoutMs;
+		}
 	}
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
@@ -2035,6 +2042,9 @@ export async function runSubagent(
 		startedAt: overallStartTime,
 		lastUpdate: overallStartTime,
 		effectiveExecutionLifetime: config.effectiveExecutionLifetime,
+		effectiveExecutionOwnership: config.executionOwnership,
+		kernelOperationDirectory: config.kernelOperationDirectory,
+		ownedWorkflowKeys: config.ownedWorkflowKeys,
 		...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
 		...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
 		...(config.toolBudget ? { toolBudget: initialToolBudgetState(config.toolBudget) } : {}),
@@ -5020,6 +5030,8 @@ export async function runSubagent(
 			})),
 			outputs,
 			workflowGraph: statusPayload.workflowGraph,
+			ownedWorkflowKeys: config.ownedWorkflowKeys,
+			effectiveExecutionOwnership: config.executionOwnership,
 			parallelHandoff: statusPayload.parallelHandoff,
 			capabilityCeiling: statusPayload.capabilityCeiling,
 			capabilityAudit: statusPayload.capabilityAudit,

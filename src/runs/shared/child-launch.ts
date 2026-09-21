@@ -45,7 +45,7 @@ export const MCP_DIRECT_TOOLS_ENV = "MCP_DIRECT_TOOLS";
  * launches inherits. Serialized into the background runner config; the
  * foreground path passes the executor's full `ChildRuntimeConfig`.
  */
-export type InheritedChildRuntime = Pick<ChildRuntimeConfig, "executionLifetime" | "depth" | "maxDepth" | "nestedRoute" | "nestedParent" | "capabilityCeiling" | "thinkingCeiling" | "runFanoutBudget" | "requiredExtensions">;
+export type InheritedChildRuntime = Pick<ChildRuntimeConfig, "executionOwnership" | "executionLifetime" | "depth" | "maxDepth" | "nestedRoute" | "nestedParent" | "capabilityCeiling" | "thinkingCeiling" | "runFanoutBudget" | "requiredExtensions">;
 
 export function inheritedChildRuntime(config: ChildRuntimeConfig | undefined): InheritedChildRuntime | undefined {
 	if (!config) return undefined;
@@ -60,10 +60,12 @@ export function inheritedChildRuntime(config: ChildRuntimeConfig | undefined): I
 		...(config.requiredExtensions ? { requiredExtensions: config.requiredExtensions } : {}),
 	};
 	if (config.executionLifetime) inherited.executionLifetime = config.executionLifetime;
+	if (config.executionOwnership) inherited.executionOwnership = config.executionOwnership;
 	return inherited;
 }
 
 export interface BuildInProcessChildLaunchInput {
+	executionOwnership?: ChildRuntimeConfig["executionOwnership"];
 	executionLifetime?: ChildRuntimeConfig["executionLifetime"];
 	machine?: HerdrMachineReference;
 	remoteSkillNames?: string[];
@@ -295,6 +297,8 @@ export function buildInProcessChildLaunch(input: BuildInProcessChildLaunchInput)
 		...(toolPlan.effectiveMcpTools.length > 0 ? { mcpDirectTools: toolPlan.effectiveMcpTools } : {}),
 		fast: input.fast === true,
 	};
+	const executionOwnership = input.executionOwnership ?? inherited?.executionOwnership;
+	if (executionOwnership) config.executionOwnership = executionOwnership;
 	const executionLifetime = input.executionLifetime ?? inherited?.executionLifetime;
 	if (executionLifetime) config.executionLifetime = executionLifetime;
 	const capturedHooks = createCapturedChildHooks(config);

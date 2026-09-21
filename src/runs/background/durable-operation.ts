@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
-import type { Details, ExecutionLifetime } from "../../shared/types.ts";
+import type { Details, ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 interface OperationResult { text: string; details?: Details; isError?: boolean }
@@ -20,12 +20,18 @@ export interface OperationIntent extends OperationIdentity {
 	sessionId?: string;
 	requestHash?: string;
 	effectiveExecutionLifetime?: ExecutionLifetime;
+	effectiveExecutionOwnership?: ExecutionOwnership;
+	executionRoute?: "single-async" | "parallel-data";
+	ownedWorkflowKeys?: string[];
 }
 
 const intentValidator = Compile(Type.Object({
 	version: Type.Literal(1), operationId: Type.String(), digest: Type.String(),
 	kind: Type.Union([Type.Literal("launch"), Type.Literal("cancel")]), runId: Type.String(),
 	sessionId: Type.Optional(Type.String()), requestHash: Type.Optional(Type.String()),
+	effectiveExecutionOwnership: Type.Optional(Type.Object({ mode: Type.Literal("kernel") })),
+	executionRoute: Type.Optional(Type.Union([Type.Literal("single-async"), Type.Literal("parallel-data")])),
+	ownedWorkflowKeys: Type.Optional(Type.Array(Type.String())),
 	effectiveExecutionLifetime: Type.Optional(Type.Union([
 		Type.Object({ mode: Type.Literal("unbounded") }),
 		Type.Object({ mode: Type.Literal("bounded"), timeoutMs: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }) }),

@@ -45,6 +45,18 @@ for (const relativePath of expectedDirectories) {
 	fs.cpSync(path.join(root, relativePath), path.join(output, relativePath), { recursive: true });
 }
 
+function copyRuntimeAssets(directory) {
+	for (const entry of fs.readdirSync(path.join(root, directory), { withFileTypes: true })) {
+		const relativePath = path.join(directory, entry.name);
+		if (entry.isDirectory()) copyRuntimeAssets(relativePath);
+		else if (/\.(?:mjs|d\.mts|c)$/.test(entry.name)) {
+			fs.mkdirSync(path.dirname(path.join(output, relativePath)), { recursive: true });
+			fs.copyFileSync(path.join(root, relativePath), path.join(output, relativePath));
+		}
+	}
+}
+copyRuntimeAssets("src");
+
 const sourcePackage = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 if (sourcePackage.private !== true) throw new Error("The source package must remain private; publish only ./dist-pkg");
 const copyFields = [
@@ -57,6 +69,12 @@ for (const field of copyFields) {
 }
 publishedPackage.types = "./index.d.ts";
 publishedPackage.exports = Object.fromEntries(Object.entries(sourcePackage.exports).map(([name, target]) => {
+	if (target && target.default?.endsWith(".mjs") && target.types?.endsWith(".d.mts")) {
+		for (const file of [target.default, target.types]) {
+			if (!fs.existsSync(path.join(output, file))) throw new Error(`Missing runtime package export: ${file}`);
+		}
+		return [name, target];
+	}
 	if (typeof target !== "string" || !target.endsWith(".ts")) throw new Error(`Unsupported package export ${name}: ${String(target)}`);
 	const base = target.slice(0, -3);
 	for (const extension of [".js", ".d.ts"]) {

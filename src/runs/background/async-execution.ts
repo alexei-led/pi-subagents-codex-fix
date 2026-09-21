@@ -1,5 +1,7 @@
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
-import type { ExecutionLifetime } from "../../shared/types.ts";
+import type { ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
+import { launchKernelOwnedProcess, prepareKernelOwnedProcess, cancelKernelOwnedProcess, inspectKernelOwnedProcessMembership, type KernelOwnedProcessRequest } from "../../api/kernel-owned-process.mjs";
+import { observeNativeKernelRun, writeNativeKernelMapping } from "./runtime-ownership.ts";
 /**
  * Async execution logic for subagent tool
  */
@@ -187,6 +189,9 @@ interface AsyncExecutionContext {
 export const DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000;
 
 interface AsyncChainParams {
+	executionOwnership?: ExecutionOwnership;
+	kernelOperationDirectory?: string;
+	ownedWorkflowKeys?: string[];
 	chain: ChainStep[];
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -252,6 +257,8 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	executionOwnership?: ExecutionOwnership;
+	kernelOperationDirectory?: string;
 	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -668,6 +675,59 @@ function isStaleExtensionContextError(error: unknown): boolean {
 	return error instanceof Error && /extension ctx is stale|stale after session replacement or reload/i.test(error.message);
 }
 
+interface KernelRunnerLaunch {
+	request: KernelOwnedProcessRequest;
+	asyncDir: string;
+	runId: string;
+	runnerProcessInstanceId: string;
+	initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">;
+	initialStatusPath: string;
+	startupProceedPath: string;
+	onBeforeProceed?: (runnerProcessInstanceId: string) => void;
+	onProcessTerminal?: (proof: unknown) => void;
+}
+
+async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunnerResult> {
+	try {
+		const prepared = await prepareKernelOwnedProcess(input.request);
+		writeNativeKernelMapping(prepared.operationDirectory, {
+			version: 1, runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId, asyncDir: input.asyncDir,
+			kernelBinding: { operationId: prepared.operationId, requestDigest: prepared.requestDigest, hostId: prepared.hostId, bootId: prepared.bootId },
+		});
+		if (fs.existsSync(path.join(path.dirname(prepared.operationDirectory), "cancel.json"))) {
+			await cancelKernelOwnedProcess(prepared.operationDirectory, { deadlineMs: 1_000 });
+			return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: "Operation cancelled before kernel runner dispatch.", startupDidNotProceed: true };
+		}
+		initializeProcessTerminal(input.asyncDir, input.runId, input.runnerProcessInstanceId);
+		input.onBeforeProceed?.(input.runnerProcessInstanceId);
+		const handle = await launchKernelOwnedProcess(input.request);
+		const pid = handle.workloadIdentity?.pid;
+		if (!pid) return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: handle.observation.reason ?? `Kernel runner did not start (${handle.observation.status}).`, startupDidNotProceed: true };
+		writePrivateAtomicJson(input.initialStatusPath, {
+			...input.initialStatus, pid, kernelOperationDirectory: prepared.operationDirectory, effectiveExecutionOwnership: { mode: "kernel" },
+			processTerminal: { version: 1, state: "pending", runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId },
+		});
+		updateActiveRunIndex(input.asyncDir, input.initialStatus.state, input.initialStatus.toolCallId);
+		writeRunnerStartupControl(input.startupProceedPath, { action: "proceed", token: input.runnerProcessInstanceId });
+		let observing = false;
+		const monitor = setInterval(() => {
+			if (observing) return;
+			observing = true;
+			void observeNativeKernelRun(prepared.operationDirectory, input.runId).then(({ processTerminalProof }) => {
+				if (processTerminalProof.state !== "observed") return;
+				writePrivateAtomicJson(path.join(input.asyncDir, "process-terminal.json"), processTerminalProof);
+				input.onProcessTerminal?.(processTerminalProof);
+				clearInterval(monitor);
+			}).catch((cause) => console.error("Kernel runner observation failed:", cause)).finally(() => { observing = false; });
+		}, 1_000);
+		monitor.unref();
+		return { pid, runnerProcessInstanceId: input.runnerProcessInstanceId };
+	} catch (error) {
+		await cancelKernelOwnedProcess(input.request.operationDirectory, { deadlineMs: 1_000 }).catch(() => undefined);
+		return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: error instanceof Error ? error.message : String(error), startupDidNotProceed: true };
+	}
+}
+
 export function emitProcessTerminalEvent(ctx: AsyncExecutionContext, proof: unknown): void {
 	try {
 		ctx.pi.events.emit(SUBAGENT_PROCESS_TERMINAL_EVENT, proof);
@@ -677,7 +737,19 @@ export function emitProcessTerminalEvent(ctx: AsyncExecutionContext, proof: unkn
 	}
 }
 
+const validatedInheritedLaunches = new WeakSet<object>();
+
 function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Omit<AsyncStatus, "pid" | "processTerminal">, initialStatusPath: string, launchParentSessionId: string | undefined, onProcessTerminal?: (proof: unknown) => void, onBeforeProceed?: (runnerProcessInstanceId: string) => void, requestedCwd = cwd): SpawnRunnerResult | Promise<SpawnRunnerResult> {
+	// SAFETY: executor-owned runner configuration has already validated the request policy.
+	const requestedOwnership = (cfg as { executionOwnership?: ExecutionOwnership }).executionOwnership;
+	const inheritedOperation = process.env.PI_KERNEL_OWNED_OPERATION;
+	if (requestedOwnership?.mode === "kernel" && inheritedOperation && !validatedInheritedLaunches.has(cfg)) {
+		return inspectKernelOwnedProcessMembership(inheritedOperation).then((membership) => {
+			if (!membership.owned) return { error: `Inherited kernel ownership is invalid: ${membership.reason ?? "current process is outside the recorded coalition"}` };
+			validatedInheritedLaunches.add(cfg);
+			return spawnRunner(cfg, suffix, cwd, initialStatus, initialStatusPath, launchParentSessionId, onProcessTerminal, onBeforeProceed, requestedCwd);
+		});
+	}
 	const cwdError = preflightLaunchCwd(requestedCwd, cwd);
 	if (cwdError) return { error: cwdError };
 	if (launchParentSessionId !== undefined && (!launchParentSessionId || launchParentSessionId.trim() !== launchParentSessionId)) {
@@ -769,6 +841,28 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		};
 		if (launchParentSessionId === undefined) delete runnerEnv[SUBAGENT_PARENT_SESSION_ENV];
 		else runnerEnv[SUBAGENT_PARENT_SESSION_ENV] = launchParentSessionId;
+		// SAFETY: these optional fields are constructed by the validated executor async launch paths.
+		const ownershipConfig = cfg as { executionOwnership?: ExecutionOwnership; kernelOperationDirectory?: string; effectiveExecutionLifetime?: ExecutionLifetime };
+		if (ownershipConfig.executionOwnership?.mode === "kernel" && !process.env.PI_KERNEL_OWNED_OPERATION) {
+			closeFd(stdoutFd);
+			closeFd(stderrFd);
+			if (hasRevivalLease) return { error: "Kernel-owned runner revival requires a fresh correlated operation after verified retirement." };
+			if (!launchAsyncDir || !startupProceedPath) return { error: "Kernel-owned runner requires a durable startup barrier." };
+			const lifetime = ownershipConfig.effectiveExecutionLifetime ?? { mode: "unbounded" };
+			const operationDirectory = ownershipConfig.kernelOperationDirectory ?? path.join(cwd, ".pi", "subagent-runtime", "owned", launchRunId);
+			writePrivateAtomicJson(cfgPath, { ...launchConfig, kernelOperationDirectory: operationDirectory });
+			const env: Record<string, string> = {};
+			for (const [key, value] of Object.entries(runnerEnv)) if (value !== undefined) env[key] = value;
+			return spawnKernelRunner({
+				request: {
+					operationDirectory,
+					artifactDirectory: path.join(cwd, ".pi", "subagent-runtime", "kernel"),
+					argv: [command, ...args], cwd, env,
+					lifetime: lifetime.mode === "unbounded" ? { kind: "unbounded" } : { kind: "bounded", timeoutMs: lifetime.timeoutMs },
+				},
+				asyncDir: launchAsyncDir, runId: launchRunId, runnerProcessInstanceId, initialStatus, initialStatusPath, startupProceedPath, onBeforeProceed, onProcessTerminal,
+			});
+		}
 		const proc = spawn(command, args, {
 			cwd,
 			...backgroundProcessOptions(),
@@ -1202,8 +1296,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
-			timeoutMs: resolveExecutionLifetime(params.executionLifetime, a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS).timeoutMs,
-			executionLifetime: params.executionLifetime,
+			timeoutMs: resolveExecutionLifetime(s.executionLifetime ?? params.executionLifetime, a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS).timeoutMs,
+			executionLifetime: s.executionLifetime ?? params.executionLifetime,
 			toolTimeoutMs: resolvedToolTimeout.toolTimeoutMs,
 			waitToolEnabled: params.waitToolEnabled,
 			waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
@@ -1368,7 +1462,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 export function executeAsyncChain(
 	id: string,
 	params: AsyncChainParams,
-): AsyncExecutionResult {
+): AsyncExecutionResult | Promise<AsyncExecutionResult> {
 	const {
 		chain,
 		agents,
@@ -1503,9 +1597,9 @@ export function executeAsyncChain(
 	const initialCompletionOwnerId = ctx.completionOwnerId ?? currentCompletionOwnerId();
 	const launchParentSessionId = ctx.parentSessionId ?? ctx.currentSessionId;
 
-	let spawnResult: SpawnRunnerResult = {};
+	let spawnResultOrPromise: SpawnRunnerResult | Promise<SpawnRunnerResult>;
 	try {
-		spawnResult = spawnRunner(
+		spawnResultOrPromise = spawnRunner(
 			{
 				id,
 				steps,
@@ -1540,6 +1634,9 @@ export function executeAsyncChain(
 				timeoutMs: lifetime.timeoutMs,
 				executionLifetime: params.executionLifetime,
 				effectiveExecutionLifetime,
+				executionOwnership: params.executionOwnership,
+				kernelOperationDirectory: params.kernelOperationDirectory,
+				ownedWorkflowKeys: params.ownedWorkflowKeys,
 				deadlineAt,
 				globalConcurrencyLimit: params.globalConcurrencyLimit,
 				runFanoutBudget,
@@ -1574,13 +1671,14 @@ export function executeAsyncChain(
 			launchParentSessionId,
 			(proof) => emitProcessTerminalEvent(ctx, proof),
 			(runnerProcessInstanceId) => params.activeAsyncCapacity?.markStarted(runnerProcessInstanceId),
-		) as SpawnRunnerResult;
+		);
 	} catch (error) {
 		params.activeAsyncCapacity?.rollback();
 		const message = error instanceof Error ? error.message : String(error);
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': ${message}`);
 	}
 
+	const finishSpawnResult = (spawnResult: SpawnRunnerResult): AsyncExecutionResult => {
 	if (spawnResult.error) {
 		if (spawnResult.startupDidNotProceed) {
 			if (!spawnResult.runnerProcessInstanceId || params.activeAsyncCapacity?.rollbackBeforeRunnerProceed(spawnResult.runnerProcessInstanceId) !== true) params.activeAsyncCapacity?.rollback();
@@ -1702,6 +1800,8 @@ export function executeAsyncChain(
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`, ctx.interactive === true) }],
 		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), effectiveExecutionLifetime, ...(lifetime.timeoutMs !== undefined ? { timeoutMs: lifetime.timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
 	};
+	};
+	return spawnResultOrPromise instanceof Promise ? spawnResultOrPromise.then(finishSpawnResult) : finishSpawnResult(spawnResultOrPromise);
 }
 
 /**
@@ -2146,6 +2246,8 @@ export function executeAsyncSingle(
 				timeoutMs,
 				executionLifetime: params.executionLifetime,
 				effectiveExecutionLifetime,
+				executionOwnership: params.executionOwnership,
+				kernelOperationDirectory: params.kernelOperationDirectory,
 				deadlineAt,
 				toolTimeoutMs,
 				checkpointBeforeDeadlineMs: params.checkpointBeforeDeadlineMs,

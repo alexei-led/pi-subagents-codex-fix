@@ -18,11 +18,20 @@ RPC `ping` advertises `executionLifetime: { version: 1, modes: ["unbounded",
 "bounded"] }`, `durableOperations: { version: 1, lookup: true, replay: true,
 cancelFence: true, scope: "repository" }`, and `workflowTerminalProof: { version: 1 }`.
 
-Full autonomous handoff is not supported yet. `processTreeOwnership` advertises
-`{ version: 1, scope: "posix-process-group", escapedDescendants: "unverified" }`.
-A client requiring containment of every descendant must reject this capability
-before dispatch. An empty POSIX group does not prove that a child did not escape
-and become reparented before the runner's observations.
+Request kernel-owned execution with `executionOwnership: { mode: "kernel" }`.
+On a supported macOS host, bounded preflight verifies the resource-coalition
+backend before advertising `processTreeOwnership` with scope `"owned-process-tree"`,
+escaped descendants `"contained"`, request mode `"kernel"`, and routes
+`["single-async", "parallel-data"]`. Other hosts retain the weaker process-group
+capability. A requested kernel-owned launch never falls back to a process group.
+
+The single route accepts async `agent`/`task` parameters. The parallel route accepts
+`ownedWorkflow: { version: 1, kind: "parallel", tasks, concurrency }`. Tasks are
+structured launch data with stable keys. The trusted runner executes them inside
+one owned root. Arbitrary workflow scripts, host commands, remote agents, external
+job providers, and top-level foreground requests are unsupported by this strict
+route. Nested processes inherit the root only after actual kernel membership has
+been verified.
 
 ## Correlated launches
 
@@ -41,8 +50,9 @@ not proof of a stalled or exited child.
 
 Intent records live under the working directory's `.pi/subagent-runtime/`, outside
 the temporary runner directories. The scope is the extension context's working
-directory. An unresolved launch
-intent remains pending when no runner evidence exists. A control timeout, missing
+directory. Kernel admission records and native-to-kernel identity mappings share
+the persistent operation directory. An unresolved launch intent remains pending
+when no runner evidence exists. A control timeout, missing
 status file, or stale session never permits a second dispatch for that identity.
 
 ## Cancellation and exit evidence
@@ -54,8 +64,21 @@ atomic launch arbitration before dispatch. Otherwise callers must observe exit
 evidence. Repeated lookup/cancel requests retry stop delivery when startup races
 with cancellation.
 
-`processTerminalProof` preserves native runner close and process-group evidence.
-It is not inferred from the wrapper's terminal state. Workflows execute in the
+For kernel-owned launches, observed `processTerminalProof` includes the full
+`processTreeOwnership` descriptor, `nativeOperation: { operationId, digest }`,
+the prepared `kernelBinding`, and the verified retired observation as `kernelProof`.
+Native operation identity and kernel request digest are different namespaces.
+The runtime checks their persisted mapping; adapters must preserve their own
+caller-to-native mapping. Retirement requires the same host, boot, and previously
+admitted coalition. Absence, silence, and empty group snapshots are insufficient.
+
+Healthy descendants may outlive the runner and drain naturally without a deadline.
+Explicit cancellation, bounded lifetime expiry, or confirmed runner failure
+initiates cleanup inside the same owned operation. No replacement writer is
+authorized until retirement is proven.
+
+Legacy `processTerminalProof` preserves runner close and process-group evidence.
+It is not inferred from the wrapper's terminal state. In-host workflows execute in the
 host process, so their separate `workflowTerminalProof` requires a durable closed
 dispatch record and full process-tree exit evidence for every detached child. Its
 observed form is `{ version: 1, kind: "workflow", state: "observed", runId,

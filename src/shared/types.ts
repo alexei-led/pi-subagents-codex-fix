@@ -702,6 +702,10 @@ export type ProcessTerminal =
 		state: "observed";
 		observedAt: number;
 		instances: ProcessInstanceExit[];
+		kernelBinding?: import("../api/kernel-owned-process.mjs").KernelOperationBinding;
+		nativeOperation?: { operationId: string; digest: string };
+		kernelProof?: import("../api/kernel-owned-process.mjs").KernelOwnedProcessObservation;
+		processTreeOwnership?: { version: 1; scope: "owned-process-tree"; escapedDescendants: "contained" };
 		canonicalSession?: CanonicalSessionTerminal;
 	})
 	| (ProcessTerminalBase & {
@@ -801,6 +805,8 @@ export interface RunFanoutRejection extends RunFanoutBudgetSnapshot {
 }
 
 export interface SteeringRecoveryDescriptor {
+	executionOwnership?: ExecutionOwnership;
+	kernelOperationDirectory?: string;
 	executionLifetime?: ExecutionLifetime;
 	effectiveExecutionLifetime?: ExecutionLifetime;
 	/** Captured response identity authority; absence means no declared aliases on revival. */
@@ -1414,9 +1420,14 @@ export interface AgentCapabilityRow {
 
 export type RunnerPhase = "model_request" | "model_stream" | "tool_in_flight" | "awaiting_input" | "exited" | "unknown";
 
+export type ExecutionOwnership = { mode: "kernel" };
+
 export type ExecutionLifetime = { mode: "unbounded" } | { mode: "bounded"; timeoutMs: number };
 
 export interface Details {
+	kernelOperationDirectory?: string;
+	effectiveExecutionOwnership?: ExecutionOwnership;
+	ownedWorkflowKeys?: string[];
 	mode: SubagentResultMode | "management";
 	workflowReceiptPath?: string;
 	runId?: string;
@@ -1868,6 +1879,9 @@ export interface ExternalProcessStatus {
 }
 
 export interface AsyncStatus {
+	ownedWorkflowKeys?: string[];
+	kernelOperationDirectory?: string;
+	effectiveExecutionOwnership?: ExecutionOwnership;
 	/** Exact reference returned by successful current workflow receipt publication. */
 	workflowReceiptPath?: string;
 	lifecycleArtifactVersion?: SubagentLifecycleArtifactVersion;
@@ -2446,6 +2460,7 @@ export interface ForegroundChildSessionControls {
 }
 
 export interface RunSyncOptions {
+	executionOwnership?: ExecutionOwnership;
 	executionLifetime?: ExecutionLifetime;
 	/** Exact discovery provenance for an unknown-agent error; omission uses defensive fallback discovery. */
 	unknownAgentDiagnosticContext?: import("../agents/agents.ts").UnknownAgentDiagnosticContext;

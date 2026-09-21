@@ -1,7 +1,9 @@
+import { parseOwnedWorkflow, validateExecutionOwnership } from "../shared/owned-workflow.ts";
 import { writeWorkflowDispatchClosed } from "../background/workflow-terminal.ts";
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
-import type { ExecutionLifetime } from "../../shared/types.ts";
+import type { ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
 import { randomUUID } from "node:crypto";
+import { inspectKernelOwnedProcessMembership } from "../../api/kernel-owned-process.mjs";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
@@ -290,6 +292,7 @@ function compactOptional<T extends object>(
 }
 
 interface TaskParam {
+	executionLifetime?: ExecutionLifetime;
 	agent: string;
 	task: string;
 	cwd?: string;
@@ -309,6 +312,10 @@ interface TaskParam {
 }
 
 export interface SubagentParamsLike {
+	executionOwnership?: ExecutionOwnership;
+	ownedWorkflow?: unknown;
+	ownedWorkflowKeys?: string[];
+	rpcKernelOperationDirectory?: string;
 	executionLifetime?: ExecutionLifetime;
 	/** Reserved by the durable RPC dispatcher before launch. */
 	rpcOperationRunId?: string;
@@ -1672,6 +1679,8 @@ function externalRunnerControlError(asyncDir: string, action: "steer" | "resume"
 }
 
 async function resumeExternalJobFollowUp(input: {
+	executionOwnership?: ExecutionOwnership;
+	kernelOperationDirectory?: string;
 	target: AsyncResumeSourceTarget;
 	followUp: string;
 	baseAgentConfig: AgentConfig;
@@ -1737,6 +1746,8 @@ async function resumeExternalJobFollowUp(input: {
 		runner: { type: "external-job", provider: runner.provider, options: runner.options },
 	};
 	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+		executionOwnership: input.executionOwnership,
+		kernelOperationDirectory: input.kernelOperationDirectory,
 		agent: input.target.agent,
 		task: input.followUp,
 		goal: input.followUp,
@@ -1886,6 +1897,9 @@ async function resumeAsyncRun(input: {
 	const modelScope = discovered.modelScope;
 	const sessionName = resolveIntercomSessionTarget(input.deps.pi.getSessionName(), input.ctx.sessionManager.getSessionId());
 	const recoveryDescriptor = "recoveryDescriptor" in target ? target.recoveryDescriptor : undefined;
+	const executionOwnership = input.params.executionOwnership ?? recoveryDescriptor?.executionOwnership;
+	const kernelOperationDirectory = input.params.rpcKernelOperationDirectory ?? recoveryDescriptor?.kernelOperationDirectory;
+	if (executionOwnership?.mode === "kernel" && attachChain) return buildRequestedModeError(input.params, "Kernel ownership does not support chain attachment during recovery.");
 	const recoveryContext = recoveryDescriptor?.context ?? (input.params.context === "profile" ? undefined : input.params.context);
 	const intercomBridge = resolveIntercomBridge({
 		config: input.deps.config.intercomBridge,
@@ -1923,6 +1937,7 @@ async function resumeAsyncRun(input: {
 			: "External runners do not persist Pi sessions and cannot be resumed.";
 		return { content: [{ type: "text", text: message }], isError: true, details: { mode: "management", results: [] } };
 	}
+	if (executionOwnership?.mode === "kernel" && (baseAgentConfig.machine || baseAgentConfig.runner?.type === "external-job" || (target.source === "async" && target.runner?.type === "external-job"))) return buildRequestedModeError(input.params, "Kernel ownership does not support remote or external-job recovery.");
 	if (target.source === "async" && target.runner?.type === "external-job") {
 		if (attachChain) return { content: [{ type: "text", text: "External-job follow-up does not support chain attachment. Use action='resume' with message instead." }], isError: true, details: { mode: "management", results: [] } };
 		return resumeExternalJobFollowUp({
@@ -1983,7 +1998,9 @@ async function resumeAsyncRun(input: {
 		const chain = wrapChainTasksForFork(attachChain, contextPolicy);
 		const normalized = normalizeSkillInput(input.params.skill);
 		const parentModel = input.parentModel;
-		const result = executeAsyncChain(runId, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
+		const result = await executeAsyncChain(runId, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
+			executionOwnership,
+			kernelOperationDirectory,
 			chain,
 			task: workflowTask,
 			goal,
@@ -2115,6 +2132,8 @@ async function resumeAsyncRun(input: {
 	const parentModel = input.parentModel;
 	const revivalAsyncDir = path.join(DIRS.async, runId);
 	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+		executionOwnership,
+		kernelOperationDirectory,
 		agent: target.agent,
 		task: buildRevivedAsyncTask(target as Parameters<typeof buildRevivedAsyncTask>[0], effectiveFollowUp),
 		goal: effectiveFollowUp,
@@ -3352,6 +3371,32 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 	const controlIntercomTarget = resolveRunLevelIntercomTarget(intercomBridge, contextPolicy);
 	const childIntercomTarget = resolveChildIntercomTargetFactory(intercomBridge, contextPolicy, id);
 
+	if (hasTasks && params.executionOwnership?.mode === "kernel" && params.tasks) {
+		const parallel = params.tasks.map((task) => omitUndefinedProperties({
+			agent: task.agent, task: task.task, model: task.model, skill: task.skill === true ? undefined : task.skill,
+			toolBudget: task.toolBudget, executionLifetime: task.executionLifetime, output: task.output,
+			outputMode: task.outputMode, progress: task.progress, acceptance: task.acceptance,
+		}));
+		const result = await executeAsyncChain(id, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
+			chain: [{ parallel, concurrency: params.concurrency }], resultMode: "parallel", ownedWorkflowKeys: params.ownedWorkflowKeys,
+			executionOwnership: params.executionOwnership, kernelOperationDirectory: params.rpcKernelOperationDirectory,
+			executionLifetime: params.executionLifetime, timeoutMs: data.timeoutMs,
+			agents, unknownAgentDiagnosticContext, ctx: asyncCtx, availableModels, cwd: effectiveCwd,
+			maxOutput: params.maxOutput, artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
+			artifactConfig, shareEnabled, sessionRoot, activeAsyncCapacity: data.activeAsyncCapacity,
+			sessionFilesByFlatIndex: params.tasks.map((task, index) => sessionFileForTask(task.agent, index, task.model)),
+			contextForAgent: contextPolicy.contextForAgent, maxSubagentDepth: currentMaxSubagentDepth,
+			waitToolEnabled: deps.waitToolEnabled, waitToolDefaultTimeoutMs: deps.waitToolDefaultTimeoutMs,
+			controlConfig, controlIntercomTarget, childIntercomTarget, nestedRoute,
+			toolBudget: data.toolBudget, configToolBudget: data.configToolBudget, usageBudget: data.usageBudget,
+			callToolTimeoutMs: params.toolTimeoutMs, configToolTimeoutMs: data.configToolTimeoutMs,
+			capabilityCeiling: data.capabilityCeiling, runFanoutBudget: data.runFanoutBudget,
+			globalConcurrencyLimit: deps.config.globalConcurrencyLimit,
+		}));
+		if (params.ownedWorkflowKeys) result.details.ownedWorkflowKeys = params.ownedWorkflowKeys;
+		return result;
+	}
+
 
 	if (hasSingle) {
 		const a = agents.find((x) => x.name === params.agent);
@@ -3391,6 +3436,8 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		const launchRuleError = applyWatchdogLaunchRules({ cwd: effectiveCwd, agent: a.name, model: modelOverride ?? (parentModel && `${parentModel.provider}/${parentModel.id}`), warn: (violation) => deps.watchdog?.displayRuleWarning(violation) });
 		if (launchRuleError) return toExecutionErrorResult(params, new Error(launchRuleError), data.contextPolicy.contextSummary);
 		const asyncResult = await executeAsyncSingle(id, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+			executionOwnership: params.executionOwnership,
+			kernelOperationDirectory: params.rpcKernelOperationDirectory,
 			agent: params.agent!,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
 			goal: params.task ?? "",
@@ -4133,6 +4180,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			},
 			timeoutMs: data.timeoutMs,
 			executionLifetime: data.params.executionLifetime,
+			executionOwnership: data.params.executionOwnership,
 			deadlineAt,
 			toolTimeoutMs: params.toolTimeoutMs,
 			configToolTimeoutMs: data.configToolTimeoutMs,
@@ -5077,6 +5125,29 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const workflowPermitContext = workflowPermitContexts.get(params);
 		const delegatedWorkflowPermit = workflowPermitContext && "root" in workflowPermitContext ? workflowPermitContext.root : undefined;
 		const workflowChildPermitLaunch = workflowPermitContext && "child" in workflowPermitContext ? workflowPermitContext.child : undefined;
+		const ownershipError = validateExecutionOwnership(params.executionOwnership);
+		if (ownershipError) return buildRequestedModeError(params, ownershipError);
+		let inheritedKernelOwnership = false;
+		if (!params.action && process.env.PI_KERNEL_OWNED_OPERATION) {
+			const membership = await inspectKernelOwnedProcessMembership(process.env.PI_KERNEL_OWNED_OPERATION);
+			if (!membership.owned) return buildRequestedModeError(params, `Inherited kernel ownership is invalid: ${membership.reason ?? "process is outside the recorded coalition"}`);
+			inheritedKernelOwnership = true;
+		}
+		if (params.executionOwnership === undefined && (deps.childRuntime?.executionOwnership || inheritedKernelOwnership)) params = { ...params, executionOwnership: deps.childRuntime?.executionOwnership ?? { mode: "kernel" } };
+		if (params.ownedWorkflow !== undefined) {
+			if (params.executionOwnership?.mode !== "kernel") return buildRequestedModeError(params, "ownedWorkflow requires executionOwnership:{mode:'kernel'}.");
+			if (params.agent || params.tasks || params.chain || params.action) return buildRequestedModeError(params, "ownedWorkflow cannot be combined with agent, tasks, chain, or management actions.");
+			const owned = parseOwnedWorkflow(params.ownedWorkflow);
+			if (!owned.ok) return buildRequestedModeError(params, owned.error);
+			const { ownedWorkflow: _ownedWorkflow, ...request } = params;
+			params = { ...request, tasks: owned.tasks, concurrency: owned.concurrency, ownedWorkflowKeys: owned.keys };
+		}
+		if (params.executionOwnership?.mode === "kernel") {
+			if (params.chain?.length) return buildRequestedModeError(params, "Kernel ownership supports single async launches and ownedWorkflow parallel data; chains are unsupported.");
+			if (params.workflowScript !== undefined || params.workflowScriptPath !== undefined || params.workflow !== undefined) return buildRequestedModeError(params, "Kernel ownership supports single async launches and ownedWorkflow parallel data; scripts and named workflows are unsupported.");
+			if (params.machine || params.machineCwd) return buildRequestedModeError(params, "Kernel ownership requires local execution.");
+			if (params.clarify || params.foregroundOnly || (params.async === false && !inheritedKernelOwnership)) return buildRequestedModeError(params, "Kernel ownership requires async execution; foreground and clarify are unsupported.");
+		}
 		if (params.executionLifetime === undefined && deps.childRuntime?.executionLifetime !== undefined) params = { ...params, executionLifetime: deps.childRuntime.executionLifetime };
 		if (!preserveActiveSession) deps.state.baseCwd = ctx.cwd;
 		deps.state.foregroundRuns ??= new Map();
@@ -5638,7 +5709,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					const workflowDeadlineAt = timeout === undefined ? undefined : Date.now() + timeout;
 					const workflowResults: SingleResult[] = [];
 					const workflowChildRunIds = new Map<string, string>();
-					const { args: _args, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, rpcOperationRunId: _rpcOperationRunId, usageBudget: _usageBudget, missionId: _missionId, mission: _mission, preflight: _preflight, globalConcurrencyLimit: _globalConcurrencyLimit, maxSubagentSpawnsPerRun: _maxSubagentSpawnsPerRun, ...workflowChildDefaults } = workflowRequest;
+					const { args: _args, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, rpcOperationRunId: _rpcOperationRunId, rpcKernelOperationDirectory: _rpcKernelOperationDirectory, usageBudget: _usageBudget, missionId: _missionId, mission: _mission, preflight: _preflight, globalConcurrencyLimit: _globalConcurrencyLimit, maxSubagentSpawnsPerRun: _maxSubagentSpawnsPerRun, ...workflowChildDefaults } = workflowRequest;
 					const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
 					const configuredOutputBaseDir = resolveConfiguredSingleRunOutputBaseDir(deps);
 					const workflowAggregateOutputPath = resolveSingleOutputPath(workflowOutput, parentCwd, workflowCwd, resolveSingleRunOutputBaseDir(deps, workflowArtifactsDir, workflowRunId));
@@ -6025,7 +6096,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					details: { mode: "workflow", runId: workflowRunId, toolCallId, asyncId: workflowRunId, asyncDir, results: [], ...(workflowPreflight ? { preflight: workflowPreflight } : {}), workflow: status.workflow, workflowChildren: status.workflowChildren, chatProgress, ...(deps.state.activeAsyncCapacity ? { activeAsyncCapacity: deps.state.activeAsyncCapacity } : {}) },
 				}, workflowFanoutBudget));
 			}
-			const { workflowScript: _workflowScript, args: _args, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, rpcOperationRunId: _rpcOperationRunId, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, preflight: _preflight, globalConcurrencyLimit: _globalConcurrencyLimit, maxSubagentSpawnsPerRun: _maxSubagentSpawnsPerRun, ...workflowChildDefaults } = requestParams;
+			const { workflowScript: _workflowScript, args: _args, action: _action, agent: _agent, task: _task, resume: _resume, tasks: _tasks, chain: _chain, concurrency: _concurrency, async: _async, foregroundOnly: _foregroundOnly, clarify: _clarify, timeoutMs: _timeoutMs, maxRuntimeMs: _maxRuntimeMs, rpcOperationRunId: _rpcOperationRunId, rpcKernelOperationDirectory: _rpcKernelOperationDirectory, usageBudget: _usageBudget, chatProgress: _chatProgress, missionId: _missionId, mission: _mission, preflight: _preflight, globalConcurrencyLimit: _globalConcurrencyLimit, maxSubagentSpawnsPerRun: _maxSubagentSpawnsPerRun, ...workflowChildDefaults } = requestParams;
 			const workflowOutput = typeof workflowChildDefaults.output === "string" || typeof workflowChildDefaults.output === "boolean" ? workflowChildDefaults.output : undefined;
 			const configuredOutputBaseDir = resolveConfiguredSingleRunOutputBaseDir(deps);
 			const workflowAggregateOutputPath = resolveSingleOutputPath(workflowOutput, ctx.cwd, workflowCwd, resolveSingleRunOutputBaseDir(deps, workflowArtifactsDir, foregroundWorkflowRunId));
@@ -7048,6 +7119,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const requestedAsync = externalAsyncRequired ? true : effectiveParams.async ?? deps.asyncByDefault;
 		const backgroundRequestedWhileClarifying = (hasChain || hasTasks) && requestedAsync && effectiveParams.clarify === true;
 		const effectiveAsync = requestedAsync && effectiveParams.clarify !== true;
+		if (effectiveParams.executionOwnership?.mode === "kernel") {
+			if (!effectiveAsync && !inheritedKernelOwnership) return buildRequestedModeError(effectiveParams, "Kernel ownership requires async execution.");
+			const unsupportedAgent = agents.find((agent) => selectedAgentNames.includes(agent.name) && (agent.machine || agent.runner?.type === "external-job"));
+			if (unsupportedAgent || effectiveParams.tasks?.some((task) => task.machine)) return buildRequestedModeError(effectiveParams, "Kernel ownership does not support remote agents or external-job providers.");
+		}
 		if (externalAgent && (!effectiveAsync || effectiveParams.foregroundOnly === true)) {
 			return buildRequestedModeError(effectiveParams, `Agent '${externalAgent.name}' uses runner.type='${externalAgent.runner?.type}', which currently supports async/background execution only. Omit async or pass async:true; clarify and foregroundOnly are unsupported.`);
 		}
@@ -7509,6 +7585,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<Details>> => {
+		if (params.ownedWorkflow !== undefined) return executeWithSingleDispatchGuard(id, params, signal, onUpdate, ctx);
 		const normalized = normalizePublicSubagentExecution(params);
 		if (!normalized.ok) {
 			return Promise.resolve({ content: [{ type: "text", text: normalized.error }], isError: true, details: { mode: normalized.mode, results: [] } });

@@ -21,7 +21,11 @@
     "./intercom-bridge": "./src/api/intercom-bridge.ts",
     "./child-tool-plan": "./src/api/child-tool-plan.ts",
     "./shared-types": "./src/api/shared-types.ts",
-    "./project-panes": "./src/api/project-panes.ts"
+    "./project-panes": "./src/api/project-panes.ts",
+    "./kernel-owned-process": {
+      "types": "./src/api/kernel-owned-process.d.mts",
+      "default": "./src/api/kernel-owned-process.mjs"
+    }
   },
   "repository": {
     "type": "git",
@@ -46,6 +50,9 @@
   "files": [
     "index.ts",
     "src/**/*.ts",
+    "src/**/*.mjs",
+    "src/**/*.d.mts",
+    "src/**/*.c",
     "*.mjs",
     "agents/",
     "skills/**/*",

@@ -29,6 +29,9 @@ import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsync
 import { DurableOperation, operationRequestHash } from "../runs/background/durable-operation.ts";
 import { readProcessTerminal } from "../runs/background/process-terminal.ts";
 import { readWorkflowTerminalProof } from "../runs/background/workflow-terminal.ts";
+import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, probeRuntimeOwnership } from "../runs/background/runtime-ownership.ts";
+import { cancelKernelOwnedProcess, type KernelOwnedProcessCapability } from "../api/kernel-owned-process.mjs";
+import { parseOwnedWorkflow } from "../runs/shared/owned-workflow.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
@@ -442,7 +445,7 @@ function sessionData(ctx: ExtensionContext | null): { cwd?: string; sessionId?: 
 	};
 }
 
-function pingData(ctx: ExtensionContext | null) {
+function pingData(ctx: ExtensionContext | null, ownership?: KernelOwnedProcessCapability) {
 	return {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		methods: [...SUBAGENT_RPC_METHODS],
@@ -464,7 +467,9 @@ function pingData(ctx: ExtensionContext | null) {
 			runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", event: "subagent:acknowledge-extension" },
 			processTerminalProof: { version: 1, lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION },
 			workflowTerminalProof: { version: 1 },
-			processTreeOwnership: { version: 1, scope: process.platform === "win32" ? "unsupported" : "posix-process-group", escapedDescendants: "unverified" },
+			processTreeOwnership: ownership?.supported
+				? { ...FULL_PROCESS_TREE_OWNERSHIP, routes: ["single-async", "parallel-data"], requestMode: "kernel" }
+				: { version: 1, scope: process.platform === "win32" ? "unsupported" : "posix-process-group", escapedDescendants: "unverified", reason: ownership?.reason ?? "Kernel preflight has not completed." },
 		},
 		events: {
 			ready: SUBAGENT_RPC_READY_EVENT,
@@ -523,6 +528,17 @@ function manageParams(params: unknown): SubagentParamsLike {
 function spawnParams(params: unknown): SubagentParamsLike {
 	const input = assertRecordParams(params, "spawn");
 	if (input.rpcOperationRunId !== undefined) throw new SubagentRpcError("invalid_params", "rpcOperationRunId is an internal field.");
+	if (input.rpcKernelOperationDirectory !== undefined) throw new SubagentRpcError("invalid_params", "rpcKernelOperationDirectory is an internal field.");
+	if (isRecord(input.executionOwnership) && input.executionOwnership.mode === "kernel" && (input.workflowScript !== undefined || input.workflowScriptPath !== undefined || input.workflow !== undefined || input.machine !== undefined || input.foregroundOnly === true || input.clarify !== undefined)) throw new SubagentRpcError("invalid_params", "Kernel ownership supports only local async single-agent or structured parallel-data launches.");
+	if (input.ownedWorkflow !== undefined) {
+		if (!isRecord(input.executionOwnership) || input.executionOwnership.mode !== "kernel") throw new SubagentRpcError("invalid_params", "ownedWorkflow requires executionOwnership.mode kernel.");
+		if (input.workflowScript !== undefined || input.workflow !== undefined || input.workflowScriptPath !== undefined || input.action !== undefined || input.agent !== undefined || input.task !== undefined || input.async === false || input.tasks !== undefined || input.chain !== undefined) throw new SubagentRpcError("invalid_params", "ownedWorkflow accepts only its structured tasks, not executable workflow or control fields.");
+		const parsed = parseOwnedWorkflow(input.ownedWorkflow);
+		if (!parsed.ok) throw new SubagentRpcError("invalid_params", parsed.error);
+		const { ownedWorkflow: _ownedWorkflow, ...rest } = input;
+		// SAFETY: root fields are checked by assertSubagentParams before executor dispatch; tasks were parsed above.
+		return { ...rest, tasks: parsed.tasks, concurrency: parsed.concurrency, ownedWorkflowKeys: parsed.keys, async: true } as SubagentParamsLike;
+	}
 	const normalized = normalizePublicSubagentExecution(input);
 	if (!normalized.ok) throw new SubagentRpcError("invalid_params", normalized.error);
 	if (normalized.params.action !== undefined) {
@@ -720,15 +736,17 @@ function operationInput(params: SubagentRpcRequestEnvelope["params"], method: Su
 	return { operationId: input.operationId, digest: input.digest, input };
 }
 
-function observeOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions) {
+async function observeOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions) {
 	const intent = operation.intent();
 	if (!intent) return { operationId: operation.operationId, state: "absent", safeToReplay: true };
 	const response = operation.result();
 	const responseRecord = operationResponseValidator.Check(response) ? response : {};
-	const asyncDir = responseRecord.details?.asyncDir ?? path.join(options.asyncDirRoot ?? DIRS.async, intent.runId);
+	const kernel = intent.effectiveExecutionOwnership?.mode === "kernel" ? await observeNativeKernelRun(path.join(operation.directory, "owned"), intent.runId) : undefined;
+	const asyncDir = kernel?.mapping?.asyncDir ?? responseRecord.details?.asyncDir ?? path.join(options.asyncDirRoot ?? DIRS.async, intent.runId);
 	const status = readStatus(asyncDir);
 	const resultPath = resolveAsyncRunLocation({ runId: intent.runId, dir: asyncDir }, options.asyncDirRoot ?? DIRS.async, options.resultsDir ?? DIRS.results).resultPath;
-	const processTerminalProof = readProcessTerminal(asyncDir, { runId: intent.runId });
+	let processTerminalProof = kernel?.processTerminalProof ?? readProcessTerminal(asyncDir, { runId: intent.runId });
+	if (kernel?.processTerminalProof.state === "observed" && (kernel.mapping?.nativeOperation?.operationId !== intent.operationId || kernel.mapping.nativeOperation.digest !== intent.digest)) processTerminalProof = { version: 1, state: "unknown", runId: intent.runId, runnerProcessInstanceId: "unknown", reason: "Kernel mapping does not match the durable native operation." };
 	const workflowTerminalProof = status?.mode === "workflow" ? readWorkflowTerminalProof(asyncDir, intent.runId) : undefined;
 	const cancellationRequested = operation.cancelled();
 	return {
@@ -741,12 +759,16 @@ function observeOperation(operation: DurableOperation, options: RegisterSubagent
 		state: cancellationRequested ? "cancelled" : response || status ? "found" : "pending",
 		safeToReplay: true,
 		cancellationRequested,
-		neverStarted: intent.kind === "cancel",
+		neverStarted: intent.kind === "cancel" || kernel?.neverStarted === true,
 		effectiveExecutionLifetime: intent.effectiveExecutionLifetime,
+		effectiveExecutionOwnership: intent.effectiveExecutionOwnership,
+		executionRoute: intent.executionRoute,
+		ownedWorkflowKeys: intent.ownedWorkflowKeys,
+		terminationReason: kernel?.observation.timedOut || (intent.effectiveExecutionLifetime?.mode === "bounded" && status?.timedOut) ? "execution_lifetime_expired" : undefined,
 		processTerminalProof,
 		workflowTerminalProof,
-		status: status?.state,
-		statusPayload: status ? { ...status, processTerminalProof, workflowTerminalProof, effectiveExecutionLifetime: intent.effectiveExecutionLifetime } : undefined,
+		status: kernel?.runnerFailed ? cancellationRequested ? "stopped" : "failed" : status?.state,
+		statusPayload: status ? { ...status, state: kernel?.runnerFailed ? cancellationRequested ? "stopped" : "failed" : status.state, error: kernel?.runnerFailed ? status.error ?? "Owned runner exited without a successful terminal result." : status.error, processTerminalProof, workflowTerminalProof, effectiveExecutionLifetime: intent.effectiveExecutionLifetime, effectiveExecutionOwnership: intent.effectiveExecutionOwnership, executionRoute: intent.executionRoute } : undefined,
 		activity: status ? {
 				state: status.activityState ?? "unknown",
 				phase: processTerminalProof?.state === "observed" || workflowTerminalProof?.state === "observed" ? "exited" : status.runnerPhase ?? "unknown",
@@ -777,13 +799,14 @@ function stopOwnedRunTree(runId: string, asyncDir: string, sessionId: string | u
 	}
 }
 
-function stopOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext): void {
+async function stopOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext): Promise<void> {
 	const intent = operation.intent();
 	if (!intent || intent.kind === "cancel") return;
-	const observation = observeOperation(operation, options);
+	const observation = await observeOperation(operation, options);
 	if (!("asyncDir" in observation)) return;
 	// A persisted workflow can outlive its in-process controller after restart.
 	stopOwnedRunTree(intent.runId, observation.asyncDir, intent.sessionId, options, ctx, new Set());
+	if (intent.effectiveExecutionOwnership?.mode === "kernel") await cancelKernelOwnedProcess(path.join(operation.directory, "owned"), { deadlineMs: 1_000 });
 }
 
 async function handleOperation(
@@ -791,19 +814,19 @@ async function handleOperation(
 	options: RegisterSubagentRpcBridgeOptions,
 	ctx: ExtensionContext,
 	activeOperations: Map<string, AbortController>,
-): Promise<ReturnType<typeof observeOperation>> {
+): Promise<Awaited<ReturnType<typeof observeOperation>>> {
 	const { operationId, digest, input } = operationInput(request.params, request.method);
 	const operation = new DurableOperation(options.operationDirRoot ?? options.asyncDirRoot ?? path.join(ctx.cwd, ".pi", "subagent-runtime"), ctx.cwd, operationId);
 	const intent = operation.intent();
 	if (intent && digest !== undefined && intent.digest !== digest) throw new SubagentRpcError("invalid_params", "Operation digest does not match its durable intent.");
 	if (request.method === "lookup") {
-		if (operation.cancelled()) stopOperation(operation, options, ctx);
+		if (operation.cancelled()) await stopOperation(operation, options, ctx);
 		return observeOperation(operation, options);
 	}
 	if (request.method === "cancel") {
 		operation.cancel(digest!);
 		activeOperations.get(operation.directory)?.abort(new Error("Operation cancelled."));
-		stopOperation(operation, options, ctx);
+		await stopOperation(operation, options, ctx);
 		return observeOperation(operation, options);
 	}
 	const { operationId: _operationId, digest: _digest, ...launchInput } = input;
@@ -813,6 +836,15 @@ async function handleOperation(
 	if (intent?.requestHash !== undefined && intent.requestHash !== requestHash) throw new SubagentRpcError("invalid_params", "Operation replay launch parameters do not match the original request.");
 	const claim: Parameters<DurableOperation["claim"]>[0] = { digest: digest!, requestHash, sessionId: resolveCurrentSessionId(ctx.sessionManager) };
 	if (params.executionLifetime !== undefined) claim.effectiveExecutionLifetime = params.executionLifetime;
+	if (params.executionOwnership?.mode === "kernel") {
+		if (!intent) {
+			const capability = await probeRuntimeOwnership(path.join(ctx.cwd, ".pi", "subagent-runtime", "kernel"));
+			if (!capability.supported) throw new SubagentRpcError("invalid_state", `Kernel process ownership is unavailable: ${capability.reason ?? "platform preflight failed"}`);
+		}
+		claim.effectiveExecutionOwnership = params.executionOwnership;
+		claim.executionRoute = params.tasks ? "parallel-data" : "single-async";
+		if (params.ownedWorkflowKeys) claim.ownedWorkflowKeys = params.ownedWorkflowKeys;
+	}
 	const claimed = operation.claim(claim);
 	if (!claimed) {
 		const winner = operation.intent();
@@ -823,9 +855,9 @@ async function handleOperation(
 	const controller = new AbortController();
 	activeOperations.set(operation.directory, controller);
 	try {
-		const result = await options.execute(`rpc-spawn-${request.requestId}`, { ...params, rpcOperationRunId: operation.runId }, controller.signal, undefined, ctx);
+		const result = await options.execute(`rpc-spawn-${request.requestId}`, { ...params, rpcOperationRunId: operation.runId, rpcKernelOperationDirectory: path.join(operation.directory, "owned") }, controller.signal, undefined, ctx);
 		operation.complete(dataFromToolResult(result));
-		if (operation.cancelled()) stopOperation(operation, options, ctx);
+		if (operation.cancelled()) await stopOperation(operation, options, ctx);
 		return observeOperation(operation, options);
 	} finally {
 		activeOperations.delete(operation.directory);
@@ -839,9 +871,9 @@ async function handleRequest(
 	activeOperations: Map<string, AbortController>,
 ): Promise<unknown> {
 	const ctx = options.getContext();
-	if (request.method === "ping") return pingData(ctx);
+	if (request.method === "ping") return pingData(ctx, ctx ? await probeRuntimeOwnership(path.join(ctx.cwd, ".pi", "subagent-runtime", "kernel")) : undefined);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
-	if (request.method === "lookup" || request.method === "cancel" || (request.method === "spawn" && isRecord(request.params) && (request.params.operationId !== undefined || request.params.digest !== undefined))) return handleOperation(request, options, ctx, activeOperations);
+	if (request.method === "lookup" || request.method === "cancel" || (request.method === "spawn" && isRecord(request.params) && (request.params.operationId !== undefined || request.params.digest !== undefined || request.params.executionOwnership !== undefined))) return handleOperation(request, options, ctx, activeOperations);
 
 	if (request.method === "manage") {
 		return executeChecked(options, ctx, request.requestId, request.method, manageParams(request.params));

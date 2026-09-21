@@ -9,6 +9,7 @@ import { readProcessTerminal } from "../background/process-terminal.ts";
 import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "../background/result-files.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, type ResolvedAsyncStatusChild } from "../shared/child-identity.ts";
+import { requestKernelOwnedProcessCancellation } from "../../api/kernel-owned-process.mjs";
 
 function getAsyncStopTarget(
 	state: SubagentState,
@@ -146,6 +147,7 @@ export function stopAsyncRun(
 	}
 	try {
 		deliverStopRequest({ asyncDir: target.asyncDir, pid: typeof status.pid === "number" ? status.pid : undefined, kill, source: "stop-action", targetIndex: child?.index, childId: child?.id ?? childId });
+		if (!childId && status.kernelOperationDirectory) void requestKernelOwnedProcessCancellation(status.kernelOperationDirectory).catch((cause) => console.error("Kernel stop request failed:", cause));
 		if (pausedWholeRun) {
 			const failure = sealPausedRun(target.asyncDir, status);
 			if (failure) {
