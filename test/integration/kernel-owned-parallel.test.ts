@@ -4,7 +4,8 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
-import { cancelKernelOwnedProcess, observeKernelOwnedProcess, preflightKernelOwnedProcess } from "../../src/api/kernel-owned-process.mjs";
+import { cancelKernelOwnedProcess, observeKernelOwnedProcess } from "../../src/api/kernel-owned-process.mjs";
+import { probeRuntimeOwnership } from "../../src/runs/background/runtime-ownership.ts";
 import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
 import { installAsyncExecutionHooks, makeAsyncExecutor, mockPi, tempDir, waitForAsyncResultFile, waitForAsyncState, waitForMockPiRuntime } from "../support/async-execution-fixture.ts";
 import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent, type SubagentRpcRequestEnvelope } from "../../src/extension/rpc.ts";
@@ -38,9 +39,16 @@ describe("kernel-owned parallel data through the native executor", () => {
 	installAsyncExecutionHooks();
 	for (const stop of [false, true]) {
 		it(stop ? "stops both live children and observes coalition retirement" : "preserves ordered task keys and outputs under unbounded ownership", { timeout: 45_000 }, async (t) => {
-			const capability = await preflightKernelOwnedProcess({ artifactDirectory: path.join(tempDir, "kernel-artifacts") });
-			if (!capability.supported) { t.skip(capability.reason ?? "Kernel ownership unavailable"); return; }
 			const operationRoot = path.join(tempDir, "operation-journal");
+			const cacheDirectory = path.join(operationRoot, "kernel-cache");
+			let capability = await probeRuntimeOwnership(cacheDirectory);
+			const readinessDeadline = Date.now() + 15_000;
+			while (!capability.supported && capability.reason === "Kernel ownership preflight is still pending." && Date.now() < readinessDeadline) {
+				await new Promise((resolve) => setTimeout(resolve, 100));
+				capability = await probeRuntimeOwnership(cacheDirectory);
+			}
+			assert.notEqual(capability.reason, "Kernel ownership preflight is still pending.");
+			if (!capability.supported) { t.skip(capability.reason ?? "Kernel ownership unavailable"); return; }
 			const operationDirectory = path.join(new DurableOperation(operationRoot, tempDir, "kernel-parallel").directory, "owned");
 			const candidateDirectory = path.join(tempDir, "candidate");
 			fs.mkdirSync(candidateDirectory);
