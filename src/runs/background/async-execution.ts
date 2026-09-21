@@ -2,6 +2,7 @@ import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime, ExecutionOwnership, ProcessTerminal } from "../../shared/types.ts";
 import { launchKernelOwnedProcess, prepareKernelOwnedProcess, cancelKernelOwnedProcess, inspectKernelOwnedProcessMembership, type KernelOwnedProcessRequest } from "../../api/kernel-owned-process.mjs";
 import { observeNativeKernelRun, writeNativeKernelMapping } from "./runtime-ownership.ts";
+import { ownedGitEnvironment } from "../shared/owned-git-environment.ts";
 /**
  * Async execution logic for subagent tool
  */
@@ -841,6 +842,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 		};
 		if (launchParentSessionId === undefined) delete runnerEnv[SUBAGENT_PARENT_SESSION_ENV];
 		else runnerEnv[SUBAGENT_PARENT_SESSION_ENV] = launchParentSessionId;
+		const processEnv = requestedOwnership?.mode === "kernel" ? ownedGitEnvironment(runnerEnv) : runnerEnv;
 		// SAFETY: these optional fields are constructed by the validated executor async launch paths.
 		const ownershipConfig = cfg as { executionOwnership?: ExecutionOwnership; kernelOperationDirectory?: string; effectiveExecutionLifetime?: ExecutionLifetime };
 		if (ownershipConfig.executionOwnership?.mode === "kernel" && !process.env.PI_KERNEL_OWNED_OPERATION) {
@@ -852,7 +854,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			const operationDirectory = ownershipConfig.kernelOperationDirectory ?? path.join(getAgentDir(), "subagent-runtime", "owned", launchRunId);
 			writePrivateAtomicJson(cfgPath, { ...launchConfig, kernelOperationDirectory: operationDirectory });
 			const env: Record<string, string> = {};
-			for (const [key, value] of Object.entries(runnerEnv)) if (value !== undefined) env[key] = value;
+			for (const [key, value] of Object.entries(processEnv)) if (value !== undefined) env[key] = value;
 			return spawnKernelRunner({
 				request: {
 					operationDirectory,
@@ -867,7 +869,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			cwd,
 			...backgroundProcessOptions(),
 			stdio: ["ignore", stdoutFd ?? "ignore", stderrFd ?? "ignore"],
-			env: runnerEnv,
+			env: processEnv,
 		});
 		let observedProcessExit: { exitCode: number | null; signal: NodeJS.Signals | null } | undefined;
 		proc.once("exit", (exitCode, signal) => { observedProcessExit = { exitCode, signal }; });

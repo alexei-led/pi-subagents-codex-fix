@@ -33,6 +33,10 @@ job providers, and top-level foreground requests are unsupported by this strict
 route. Nested processes inherit the root only after actual kernel membership has
 been verified.
 
+Strict workers remove inherited Git repository selectors and injected per-command
+configuration before the kernel request is frozen. Author, committer, SSH, and
+authentication settings remain available. The parent environment is unchanged.
+
 ## Correlated launches
 
 Send `operationId` and `digest` together on `spawn`, alongside the ordinary launch

@@ -7,7 +7,7 @@ import { Type, type Static } from "typebox";
 import { Compile } from "typebox/compile";
 import { createEventBus, makeMinimalCtx } from "../support/helpers.ts";
 import type { ExecutionLifetime } from "../../src/shared/types.ts";
-import { DurableOperation, type OperationIdentity } from "../../src/runs/background/durable-operation.ts";
+import { DurableOperation, operationRequestHash, type OperationIdentity } from "../../src/runs/background/durable-operation.ts";
 import { stopRequestsDir, consumeSteerRequests } from "../../src/runs/background/control-channel.ts";
 import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent, type SubagentRpcMethod } from "../../src/extension/rpc.ts";
 
@@ -22,6 +22,7 @@ function context(cwd: string, session = "session-1") {
 }
 
 interface OperationRequest extends OperationIdentity {
+	cwd?: string;
 	agent?: string;
 	task?: string;
 	executionLifetime?: ExecutionLifetime;
@@ -108,6 +109,27 @@ it("arbitrates one operation identity across concurrent working-directory scopes
 		assert.equal(late.cancelled(), true);
 		assert.equal(late.runId, cancellation.runId);
 	} finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it("keeps an anchor-only reservation pending and resolves relative cwd against its original scope", async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "durable-anchor-only-"));
+	const originalCwd = path.join(root, "original-worktree");
+	const operation = new DurableOperation(root, originalCwd, launch.operationId);
+	operation.claim({ digest: launch.digest, requestHash: operationRequestHash({ agent: launch.agent, task: launch.task, output: true, executionLifetime: launch.executionLifetime, async: true, cwd: path.join(originalCwd, "sub") }) });
+	fs.rmSync(path.join(operation.directory, "intent.json"));
+	const events = createEventBus();
+	let dispatches = 0;
+	const bridge = registerSubagentRpcBridge({ events, asyncDirRoot: root, getContext: () => context(path.join(root, "new-worktree")), execute: async (_id, params) => {
+		dispatches++;
+		assert.equal(params.cwd, path.join(originalCwd, "sub"));
+		return { content: [], details: { mode: "single", results: [], runId: params.rpcOperationRunId } };
+	} });
+	try {
+		assert.equal((await request(events, "lookup", { operationId: launch.operationId, digest: launch.digest })).state, "pending");
+		await assert.rejects(request(events, "lookup", { operationId: launch.operationId, digest: "foreign" }), /digest/);
+		assert.equal((await request(events, "spawn", { ...launch, cwd: "./sub" })).runId, operation.runId);
+		assert.equal(dispatches, 1);
+	} finally { bridge.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 it("fences a delayed spawn before dispatch and retains the fence after restart", async () => {
@@ -252,6 +274,19 @@ it("bounds transport filenames for long opaque diagnostic identifiers", async ()
 		assert.equal(controls.length, 1);
 		assert.match(controls[0]?.id ?? "", /^diagnostic-[0-9a-f]{64}$/);
 		assert.equal((await request(fixture.events, "diagnose", { ...diagnosis, diagnosticId })).state, "queued");
+		assert.deepEqual(consumeSteerRequests(fixture.asyncDir), []);
+	} finally { bridge.dispose(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+it("rejects a tool call identifier that is ambiguous across live child sessions", async () => {
+	const fixture = diagnosticFixture();
+	const statusPath = path.join(fixture.asyncDir, "status.json");
+	const status = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+	status.steps.push({ ...status.steps[0], agent: "another-worker" });
+	fs.writeFileSync(statusPath, JSON.stringify(status));
+	const bridge = registerSubagentRpcBridge(fixture.options);
+	try {
+		assert.equal((await request(fixture.events, "diagnose", diagnosis)).state, "rejected");
 		assert.deepEqual(consumeSteerRequests(fixture.asyncDir), []);
 	} finally { bridge.dispose(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });

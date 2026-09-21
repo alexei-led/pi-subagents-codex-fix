@@ -149,7 +149,12 @@ export class DurableOperation {
 	intent(): OperationIntent | undefined {
 		const anchor = this.resolveScope();
 		const value = read(path.join(this.directory, "intent.json"));
-		if (value === undefined) return anchor?.kind === "cancel" ? { version: 1, kind: "cancel", operationId: this.operationId, digest: anchor.digest, runId: this.runId } : undefined;
+		if (value === undefined) {
+			if (!anchor) return undefined;
+			const reservation: OperationIntent = { version: 1, kind: anchor.kind, operationId: this.operationId, digest: anchor.digest, runId: this.runId };
+			if (anchor.requestHash !== undefined) reservation.requestHash = anchor.requestHash;
+			return reservation;
+		}
 		if (!intentValidator.Check(value) || value.operationId !== this.operationId || value.runId !== this.runId) throw new Error("Invalid durable operation intent; ownership is unknown.");
 		return value;
 	}

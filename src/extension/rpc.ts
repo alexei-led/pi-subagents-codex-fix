@@ -731,7 +731,7 @@ function stopAsyncRun(
 	};
 }
 
-const operationIdentityValidator = Compile(Type.Object({ operationId: Type.String({ minLength: 1, maxLength: 512, pattern: "^[^\\r\\n]+$" }), digest: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })) }));
+const operationIdentityValidator = Compile(Type.Object({ operationId: Type.String({ minLength: 1, maxLength: 512, pattern: "^[^\\r\\n]+$" }), digest: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })), cwd: Type.Optional(Type.String()) }));
 const operationResponseValidator = Compile(Type.Object({ text: Type.Optional(Type.String()), details: Type.Optional(Type.Object({ asyncDir: Type.Optional(Type.String()) })), isError: Type.Optional(Type.Boolean()) }));
 const diagnosticValidator = Compile(Type.Object({ diagnosticId: Type.String({ minLength: 1, maxLength: 256 }), toolCallId: Type.String({ minLength: 1, maxLength: 512 }), message: Type.String({ minLength: 1, maxLength: 4096 }) }));
 const diagnosticReceiptValidator = Compile(Type.Object({ state: Type.Union([Type.Literal("queued"), Type.Literal("cancelled"), Type.Literal("rejected")]), reason: Type.Optional(Type.String()) }));
@@ -857,7 +857,8 @@ async function handleOperation(
 			return { ...identity, state: "cancelled" };
 		}
 		const status = "statusPayload" in observation ? observation.statusPayload : undefined;
-		const targetIndex = status?.steps?.findIndex((step) => step.lastToolFailure?.toolCallId === diagnostic.toolCallId) ?? -1;
+		const targets = status?.steps?.flatMap((step, index) => step.lastToolFailure?.toolCallId === diagnostic.toolCallId ? [index] : []) ?? [];
+		const targetIndex = targets.length === 1 ? targets[0]! : -1;
 		if (!("asyncDir" in observation) || status?.state !== "running" || targetIndex < 0 || status.steps?.[targetIndex]?.status !== "running") {
 			const receipt = { state: "rejected" as const, reason: "The referenced failed tool is not in a live child session." };
 			operation.completeDiagnostic(diagnostic.diagnosticId, receipt);
@@ -873,8 +874,7 @@ async function handleOperation(
 		return { ...identity, state: "queued" };
 	}
 	const { operationId: _operationId, digest: _digest, ...launchInput } = input;
-	const requestedCwd = "cwd" in launchInput ? launchInput.cwd : undefined;
-	const params = spawnParams({ ...launchInput, cwd: requestedCwd ?? operation.scopeCwd ?? ctx.cwd });
+	const params = spawnParams({ ...launchInput, cwd: path.resolve(operation.scopeCwd ?? ctx.cwd, launchInput.cwd ?? ".") });
 	assertSubagentParams(params, "RPC spawn params");
 	const requestHash = operationRequestHash(params);
 	if (intent?.requestHash !== undefined && intent.requestHash !== requestHash) throw new SubagentRpcError("invalid_params", "Operation replay launch parameters do not match the original request.");
