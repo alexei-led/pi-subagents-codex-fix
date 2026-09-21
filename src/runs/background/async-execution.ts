@@ -692,10 +692,6 @@ interface KernelRunnerLaunch {
 async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunnerResult> {
 	try {
 		const prepared = await prepareKernelOwnedProcess(input.request);
-		if (fs.existsSync(path.join(path.dirname(prepared.operationDirectory), "cancel.json"))) {
-			await cancelKernelOwnedProcess(prepared.operationDirectory, { deadlineMs: 1_000 });
-			return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: "Operation cancelled before kernel runner dispatch.", startupDidNotProceed: true };
-		}
 		initializeProcessTerminal(input.asyncDir, input.runId, input.runnerProcessInstanceId);
 		input.onBeforeProceed?.(input.runnerProcessInstanceId);
 		writePrivateAtomicJson(input.initialStatusPath, {
@@ -707,6 +703,10 @@ async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunner
 			version: 1, runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId, asyncDir: input.asyncDir,
 			kernelBinding: { operationId: prepared.operationId, requestDigest: prepared.requestDigest, hostId: prepared.hostId, bootId: prepared.bootId },
 		});
+		if (fs.existsSync(path.join(path.dirname(prepared.operationDirectory), "cancel.json"))) {
+			await cancelKernelOwnedProcess(prepared.operationDirectory, { deadlineMs: 1_000 });
+			return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: "Operation cancelled before kernel runner dispatch.", startupDidNotProceed: true };
+		}
 		writeRunnerStartupControl(input.startupProceedPath, { action: "proceed", token: input.runnerProcessInstanceId });
 		const handle = await launchKernelOwnedProcess(input.request);
 		const pid = handle.workloadIdentity?.pid;
