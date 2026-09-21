@@ -2,6 +2,7 @@ import { Type, type Static } from "typebox";
 import { Compile } from "typebox/compile";
 import type { AcceptanceInput, ExecutionLifetime, ExecutionOwnership, OutputMode } from "../../shared/types.ts";
 import type { SubagentParamsLike } from "../foreground/subagent-executor.ts";
+import { normalizePublicSubagentExecution } from "../../extension/public-execution.ts";
 import { validateAcceptanceInput } from "./acceptance.ts";
 import { validateToolBudgetConfig } from "./tool-budget.ts";
 
@@ -58,4 +59,10 @@ export function parseOwnedWorkflow(value: unknown): OwnedWorkflowParseResult {
 export function validateExecutionOwnership(value: unknown): string | undefined {
 	if (value !== undefined && !ownershipValidator.Check(value)) return "executionOwnership must be { mode: 'kernel' }.";
 	return undefined;
+}
+
+export function validateOwnedWorkflowPublicFields(params: SubagentParamsLike): string | undefined {
+	const { ownedWorkflow: _ownedWorkflow, ...root } = params;
+	const validated = normalizePublicSubagentExecution({ ...root, agent: "owned-workflow-validation", task: "Validate structured launch fields." });
+	return validated.ok ? undefined : validated.error;
 }

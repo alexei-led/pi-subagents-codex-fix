@@ -131,6 +131,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 		"./child-tool-plan": "./src/api/child-tool-plan.ts",
 		"./shared-types": "./src/api/shared-types.ts",
 		"./project-panes": "./src/api/project-panes.ts",
+		"./kernel-owned-process": { types: "./src/api/kernel-owned-process.d.mts", default: "./src/api/kernel-owned-process.mjs" },
 	});
 	const agents = await import("pi-subagents/agents");
 	assert.equal(agents.RUNTIME_AGENT_REGISTER_EVENT, "pi-subagents:runtime-agent-register:v1");
@@ -176,6 +177,10 @@ test("published extension APIs use supported package entrypoints", async () => {
 	assert.equal(typeof projectPanes.openProjectPane, "function");
 	assert.equal(typeof projectPanes.getProjectPaneStatus, "function");
 	assert.equal(typeof projectPanes.closeProjectPane, "function");
+	const kernel = await import("pi-subagents/kernel-owned-process");
+	assert.equal(typeof kernel.prepareKernelOwnedProcess, "function");
+	assert.equal(typeof kernel.launchKernelOwnedProcess, "function");
+	assert.equal(typeof kernel.inspectKernelOwnedProcessMembership, "function");
 });
 
 test("direct @earendil-works runtime imports are declared for CI installs", () => {

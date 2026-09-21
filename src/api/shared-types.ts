@@ -12,6 +12,8 @@ export {
 	type Details,
 	type ExecutionProjection,
 	type ExecutionLifetime,
+	type ExecutionOwnership,
+	type LastToolFailure,
 	type ExternalJobRunnerStatus,
 	type ExternalJobStatus,
 	type IntercomBridgeConfig,

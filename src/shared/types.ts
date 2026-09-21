@@ -1418,6 +1418,14 @@ export interface AgentCapabilityRow {
 	extensions?: { names?: string[]; subagentOnly?: string[]; skills?: string[] };
 }
 
+export interface LastToolFailure {
+	kind: "tool-execution-error";
+	toolCallId: string;
+	toolName: string;
+	observedAt: number;
+	message: string;
+}
+
 export type RunnerPhase = "model_request" | "model_stream" | "tool_in_flight" | "awaiting_input" | "exited" | "unknown";
 
 export type ExecutionOwnership = { mode: "kernel" };
@@ -1879,6 +1887,7 @@ export interface ExternalProcessStatus {
 }
 
 export interface AsyncStatus {
+	lastToolFailure?: LastToolFailure;
 	ownedWorkflowKeys?: string[];
 	kernelOperationDirectory?: string;
 	effectiveExecutionOwnership?: ExecutionOwnership;
@@ -1993,6 +2002,7 @@ export interface AsyncStatus {
 		runnerPhaseObservedAt?: number;
 		lastModelActivityAt?: number;
 		lastToolActivityAt?: number;
+		lastToolFailure?: LastToolFailure;
 		lastActivityAt?: number;
 		currentTool?: string;
 		currentToolArgs?: string;

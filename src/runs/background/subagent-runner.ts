@@ -1,3 +1,6 @@
+import { Type } from "typebox";
+import { Compile } from "typebox/compile";
+import { sanitizeDisplayText, truncateDisplayText } from "../../shared/display-text.ts";
 import { observeRunnerPhase } from "../shared/runner-phase.ts";
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime } from "../../shared/types.ts";
@@ -164,6 +167,13 @@ import {
 	resolveChildWatchdogConfig,
 	type ChildWatchdogStatusEvent,
 } from "../../watchdog/child-status.ts";
+
+const confirmedToolFailure = Compile(Type.Object({
+	type: Type.Literal("tool_execution_end"), isError: Type.Literal(true),
+	toolCallId: Type.String({ minLength: 1 }), toolName: Type.String({ minLength: 1 }),
+	result: Type.Optional(Type.Unknown()),
+}));
+const toolFailureContent = Compile(Type.Object({ content: Type.Unknown() }));
 
 const INTERCOM_DETACH_RECEIPT = "Detached for intercom coordination before task completion.";
 
@@ -2975,6 +2985,7 @@ export async function runSubagent(
 		if (!step) return;
 		const previousActivityState = step.activityState;
 		const previousRunnerPhase = step.runnerPhase;
+		const previousToolFailure = step.lastToolFailure;
 		const now = Date.now();
 		statusPayload.currentStep = flatIndex;
 		if (isChildWatchdogStatusEvent(event)) {
@@ -3043,6 +3054,12 @@ export async function runSubagent(
 				})));
 			}
 		} else if (event.type === "tool_execution_end") {
+			if (confirmedToolFailure.Check(event)) {
+				const text = toolFailureContent.Check(event.result) ? extractTextFromContent(event.result.content) : "";
+				const message = truncateDisplayText(sanitizeDisplayText(text), 512) || "Tool execution failed.";
+				step.lastToolFailure = { kind: "tool-execution-error", toolCallId: event.toolCallId, toolName: event.toolName, observedAt: now, message };
+				statusPayload.lastToolFailure = step.lastToolFailure;
+			}
 			const endedTool = removeActiveToolCall(flatIndex, event);
 			if (endedTool) {
 				step.recentTools ??= [];
@@ -3148,7 +3165,7 @@ export async function runSubagent(
 		statusPayload.lastUpdate = now;
 		maybeEmitActiveLongRunning(flatIndex, now);
 		// A sibling may keep aggregate attention unchanged; publish this step's transition.
-		writeStatusPayload(step.activityState !== previousActivityState);
+		writeStatusPayload(step.activityState !== previousActivityState || step.lastToolFailure !== previousToolFailure);
 	};
 	const updateRunnerActivityState = (now: number, skipExternalProbeIndex?: number): boolean => {
 		if (!controlConfig.enabled) return false;

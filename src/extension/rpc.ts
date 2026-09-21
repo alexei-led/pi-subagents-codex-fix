@@ -1,10 +1,11 @@
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
 import { Type } from "typebox";
 import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
-import { deliverStopRequest } from "../runs/background/control-channel.ts";
+import { deliverStopRequest, requestAsyncSteer } from "../runs/background/control-channel.ts";
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
@@ -21,7 +22,7 @@ import {
 	type SubagentChildStatusEvent,
 } from "../shared/types.ts";
 import { sanitizeDisplayText, truncateDisplayText } from "../shared/display-text.ts";
-import { readStatus } from "../shared/utils.ts";
+import { getAgentDir, readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
 import { ASYNC_STATUS_SNAPSHOT_KIND, ASYNC_STATUS_SNAPSHOT_VERSION, buildAsyncStatusSnapshotForState } from "../runs/background/async-status-snapshot.ts";
@@ -31,14 +32,14 @@ import { readProcessTerminal } from "../runs/background/process-terminal.ts";
 import { readWorkflowTerminalProof } from "../runs/background/workflow-terminal.ts";
 import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, probeRuntimeOwnership } from "../runs/background/runtime-ownership.ts";
 import { cancelKernelOwnedProcess, type KernelOwnedProcessCapability } from "../api/kernel-owned-process.mjs";
-import { parseOwnedWorkflow } from "../runs/shared/owned-workflow.ts";
+import { parseOwnedWorkflow, validateOwnedWorkflowPublicFields } from "../runs/shared/owned-workflow.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 export const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
 export const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 
-export const SUBAGENT_RPC_METHODS = ["ping", "status", "manage", "spawn", "lookup", "cancel", "steer", "interrupt", "stop", "resume"] as const;
+export const SUBAGENT_RPC_METHODS = ["ping", "status", "manage", "spawn", "lookup", "cancel", "diagnose", "steer", "interrupt", "stop", "resume"] as const;
 export type SubagentRpcMethod = typeof SUBAGENT_RPC_METHODS[number];
 
 export interface SubagentRpcRequestEnvelope {
@@ -451,7 +452,7 @@ function pingData(ctx: ExtensionContext | null, ownership?: KernelOwnedProcessCa
 		methods: [...SUBAGENT_RPC_METHODS],
 		capabilities: {
 			executionLifetime: { version: 1, modes: ["unbounded", "bounded"] },
-			durableOperations: { version: 1, lookup: true, replay: true, cancelFence: true, scope: "repository" },
+			durableOperations: { version: 1, lookup: true, replay: true, cancelFence: true, scope: "runtime" },
 			status: true,
 			statusProjection: { version: 1, untargeted: "in-memory-when-ready", targeted: "executor" },
 			managementActions: [...SUBAGENT_RPC_MANAGEMENT_ACTIONS],
@@ -470,6 +471,7 @@ function pingData(ctx: ExtensionContext | null, ownership?: KernelOwnedProcessCa
 			processTreeOwnership: ownership?.supported
 				? { ...FULL_PROCESS_TREE_OWNERSHIP, routes: ["single-async", "parallel-data"], requestMode: "kernel" }
 				: { version: 1, scope: process.platform === "win32" ? "unsupported" : "posix-process-group", escapedDescendants: "unverified", reason: ownership?.reason ?? "Kernel preflight has not completed." },
+			diagnosticGuidance: { version: 1, idempotent: true, mode: "follow_up", confirmedToolFailure: true },
 		},
 		events: {
 			ready: SUBAGENT_RPC_READY_EVENT,
@@ -535,9 +537,11 @@ function spawnParams(params: unknown): SubagentParamsLike {
 		if (input.workflowScript !== undefined || input.workflow !== undefined || input.workflowScriptPath !== undefined || input.action !== undefined || input.agent !== undefined || input.task !== undefined || input.async === false || input.tasks !== undefined || input.chain !== undefined) throw new SubagentRpcError("invalid_params", "ownedWorkflow accepts only its structured tasks, not executable workflow or control fields.");
 		const parsed = parseOwnedWorkflow(input.ownedWorkflow);
 		if (!parsed.ok) throw new SubagentRpcError("invalid_params", parsed.error);
-		const { ownedWorkflow: _ownedWorkflow, ...rest } = input;
-		// SAFETY: root fields are checked by assertSubagentParams before executor dispatch; tasks were parsed above.
-		return { ...rest, tasks: parsed.tasks, concurrency: parsed.concurrency, ownedWorkflowKeys: parsed.keys, async: true } as SubagentParamsLike;
+		// SAFETY: root fields are checked before dispatch; preserve the validated public data route through executePublic.
+		const request = { ...input, ownedWorkflowKeys: parsed.keys, async: true } as SubagentParamsLike;
+		const error = validateOwnedWorkflowPublicFields(request);
+		if (error) throw new SubagentRpcError("invalid_params", error);
+		return request;
 	}
 	const normalized = normalizePublicSubagentExecution(input);
 	if (!normalized.ok) throw new SubagentRpcError("invalid_params", normalized.error);
@@ -729,6 +733,12 @@ function stopAsyncRun(
 
 const operationIdentityValidator = Compile(Type.Object({ operationId: Type.String({ minLength: 1, maxLength: 512, pattern: "^[^\\r\\n]+$" }), digest: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })) }));
 const operationResponseValidator = Compile(Type.Object({ text: Type.Optional(Type.String()), details: Type.Optional(Type.Object({ asyncDir: Type.Optional(Type.String()) })), isError: Type.Optional(Type.Boolean()) }));
+const diagnosticValidator = Compile(Type.Object({ diagnosticId: Type.String({ minLength: 1, maxLength: 256 }), toolCallId: Type.String({ minLength: 1, maxLength: 512 }), message: Type.String({ minLength: 1, maxLength: 4096 }) }));
+const diagnosticReceiptValidator = Compile(Type.Object({ state: Type.Union([Type.Literal("queued"), Type.Literal("cancelled"), Type.Literal("rejected")]), reason: Type.Optional(Type.String()) }));
+
+function operationStorageRoot(options: RegisterSubagentRpcBridgeOptions): string {
+	return options.operationDirRoot ?? options.asyncDirRoot ?? path.join(getAgentDir(), "subagent-runtime");
+}
 
 function operationInput(params: SubagentRpcRequestEnvelope["params"], method: SubagentRpcMethod) {
 	const input = assertRecordParams(params, method);
@@ -749,6 +759,7 @@ async function observeOperation(operation: DurableOperation, options: RegisterSu
 	if (kernel?.processTerminalProof.state === "observed" && (kernel.mapping?.nativeOperation?.operationId !== intent.operationId || kernel.mapping.nativeOperation.digest !== intent.digest)) processTerminalProof = { version: 1, state: "unknown", runId: intent.runId, runnerProcessInstanceId: "unknown", reason: "Kernel mapping does not match the durable native operation." };
 	const workflowTerminalProof = status?.mode === "workflow" ? readWorkflowTerminalProof(asyncDir, intent.runId) : undefined;
 	const cancellationRequested = operation.cancelled();
+	const stopped = cancellationRequested || status?.stopped === true;
 	return {
 		...responseRecord,
 		operationId: intent.operationId,
@@ -767,14 +778,15 @@ async function observeOperation(operation: DurableOperation, options: RegisterSu
 		terminationReason: kernel?.observation.timedOut || (intent.effectiveExecutionLifetime?.mode === "bounded" && status?.timedOut) ? "execution_lifetime_expired" : undefined,
 		processTerminalProof,
 		workflowTerminalProof,
-		status: kernel?.runnerFailed ? cancellationRequested ? "stopped" : "failed" : status?.state,
-		statusPayload: status ? { ...status, state: kernel?.runnerFailed ? cancellationRequested ? "stopped" : "failed" : status.state, error: kernel?.runnerFailed ? status.error ?? "Owned runner exited without a successful terminal result." : status.error, processTerminalProof, workflowTerminalProof, effectiveExecutionLifetime: intent.effectiveExecutionLifetime, effectiveExecutionOwnership: intent.effectiveExecutionOwnership, executionRoute: intent.executionRoute } : undefined,
+		status: kernel?.runnerFailed ? stopped ? "stopped" : "failed" : status?.state,
+		statusPayload: status ? { ...status, state: kernel?.runnerFailed ? stopped ? "stopped" : "failed" : status.state, error: kernel?.runnerFailed ? status.error ?? "Owned runner exited without a successful terminal result." : status.error, processTerminalProof, workflowTerminalProof, effectiveExecutionLifetime: intent.effectiveExecutionLifetime, effectiveExecutionOwnership: intent.effectiveExecutionOwnership, executionRoute: intent.executionRoute } : undefined,
 		activity: status ? {
 				state: status.activityState ?? "unknown",
 				phase: processTerminalProof?.state === "observed" || workflowTerminalProof?.state === "observed" ? "exited" : status.runnerPhase ?? "unknown",
 				lastActivityAt: status.lastActivityAt,
 				lastModelActivityAt: status.lastModelActivityAt,
 				lastToolActivityAt: status.lastToolActivityAt,
+				lastToolFailure: status.lastToolFailure,
 				currentTool: status.currentTool,
 				currentToolStartedAt: status.currentToolStartedAt,
 				runnerPid: status.pid,
@@ -814,9 +826,9 @@ async function handleOperation(
 	options: RegisterSubagentRpcBridgeOptions,
 	ctx: ExtensionContext,
 	activeOperations: Map<string, AbortController>,
-): Promise<Awaited<ReturnType<typeof observeOperation>>> {
+) {
 	const { operationId, digest, input } = operationInput(request.params, request.method);
-	const operation = new DurableOperation(options.operationDirRoot ?? options.asyncDirRoot ?? path.join(ctx.cwd, ".pi", "subagent-runtime"), ctx.cwd, operationId);
+	const operation = new DurableOperation(operationStorageRoot(options), ctx.cwd, operationId);
 	const intent = operation.intent();
 	if (intent && digest !== undefined && intent.digest !== digest) throw new SubagentRpcError("invalid_params", "Operation digest does not match its durable intent.");
 	if (request.method === "lookup") {
@@ -829,8 +841,40 @@ async function handleOperation(
 		await stopOperation(operation, options, ctx);
 		return observeOperation(operation, options);
 	}
+	if (request.method === "diagnose") {
+		if (!intent) throw new SubagentRpcError("not_found", "No durable operation exists for diagnostic guidance.");
+		if (!diagnosticValidator.Check(input) || !input.diagnosticId.trim() || !input.message.trim()) throw new SubagentRpcError("invalid_params", "Diagnostic guidance requires diagnosticId, toolCallId and a nonempty message.");
+		const diagnostic = { diagnosticId: input.diagnosticId, toolCallId: input.toolCallId, message: input.message };
+		const claimed = operation.claimDiagnostic(diagnostic);
+		const identity = { operationId: intent.operationId, digest: intent.digest, runId: intent.runId, diagnosticId: diagnostic.diagnosticId, toolCallId: diagnostic.toolCallId, guidanceOnly: true };
+		if (!claimed) {
+			const receipt = operation.diagnosticReceipt(diagnostic.diagnosticId);
+			return diagnosticReceiptValidator.Check(receipt) ? { ...identity, ...receipt } : { ...identity, state: "pending" };
+		}
+		const observation = await observeOperation(operation, options);
+		if (operation.cancelled()) {
+			operation.completeDiagnostic(diagnostic.diagnosticId, { state: "cancelled" });
+			return { ...identity, state: "cancelled" };
+		}
+		const status = "statusPayload" in observation ? observation.statusPayload : undefined;
+		const targetIndex = status?.steps?.findIndex((step) => step.lastToolFailure?.toolCallId === diagnostic.toolCallId) ?? -1;
+		if (!("asyncDir" in observation) || status?.state !== "running" || targetIndex < 0 || status.steps?.[targetIndex]?.status !== "running") {
+			const receipt = { state: "rejected" as const, reason: "The referenced failed tool is not in a live child session." };
+			operation.completeDiagnostic(diagnostic.diagnosticId, receipt);
+			return { ...identity, ...receipt };
+		}
+		if (operation.cancelled()) {
+			operation.completeDiagnostic(diagnostic.diagnosticId, { state: "cancelled" });
+			return { ...identity, state: "cancelled" };
+		}
+		const controlId = `diagnostic-${createHash("sha256").update(diagnostic.diagnosticId).digest("hex")}`;
+		requestAsyncSteer(observation.asyncDir, { id: controlId, message: diagnostic.message, mode: "follow_up", targetIndex, source: "confirmed-tool-failure-diagnosis" });
+		operation.completeDiagnostic(diagnostic.diagnosticId, { state: "queued" });
+		return { ...identity, state: "queued" };
+	}
 	const { operationId: _operationId, digest: _digest, ...launchInput } = input;
-	const params = spawnParams(launchInput);
+	const requestedCwd = "cwd" in launchInput ? launchInput.cwd : undefined;
+	const params = spawnParams({ ...launchInput, cwd: requestedCwd ?? operation.scopeCwd ?? ctx.cwd });
 	assertSubagentParams(params, "RPC spawn params");
 	const requestHash = operationRequestHash(params);
 	if (intent?.requestHash !== undefined && intent.requestHash !== requestHash) throw new SubagentRpcError("invalid_params", "Operation replay launch parameters do not match the original request.");
@@ -838,11 +882,11 @@ async function handleOperation(
 	if (params.executionLifetime !== undefined) claim.effectiveExecutionLifetime = params.executionLifetime;
 	if (params.executionOwnership?.mode === "kernel") {
 		if (!intent) {
-			const capability = await probeRuntimeOwnership(path.join(ctx.cwd, ".pi", "subagent-runtime", "kernel"));
+			const capability = await probeRuntimeOwnership(path.join(operationStorageRoot(options), "kernel-cache"));
 			if (!capability.supported) throw new SubagentRpcError("invalid_state", `Kernel process ownership is unavailable: ${capability.reason ?? "platform preflight failed"}`);
 		}
 		claim.effectiveExecutionOwnership = params.executionOwnership;
-		claim.executionRoute = params.tasks ? "parallel-data" : "single-async";
+		claim.executionRoute = params.ownedWorkflow !== undefined ? "parallel-data" : "single-async";
 		if (params.ownedWorkflowKeys) claim.ownedWorkflowKeys = params.ownedWorkflowKeys;
 	}
 	const claimed = operation.claim(claim);
@@ -871,9 +915,9 @@ async function handleRequest(
 	activeOperations: Map<string, AbortController>,
 ): Promise<unknown> {
 	const ctx = options.getContext();
-	if (request.method === "ping") return pingData(ctx, ctx ? await probeRuntimeOwnership(path.join(ctx.cwd, ".pi", "subagent-runtime", "kernel")) : undefined);
+	if (request.method === "ping") return pingData(ctx, ctx ? await probeRuntimeOwnership(path.join(operationStorageRoot(options), "kernel-cache")) : undefined);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
-	if (request.method === "lookup" || request.method === "cancel" || (request.method === "spawn" && isRecord(request.params) && (request.params.operationId !== undefined || request.params.digest !== undefined || request.params.executionOwnership !== undefined))) return handleOperation(request, options, ctx, activeOperations);
+	if (request.method === "lookup" || request.method === "cancel" || request.method === "diagnose" || (request.method === "spawn" && isRecord(request.params) && (request.params.operationId !== undefined || request.params.digest !== undefined || request.params.executionOwnership !== undefined))) return handleOperation(request, options, ctx, activeOperations);
 
 	if (request.method === "manage") {
 		return executeChecked(options, ctx, request.requestId, request.method, manageParams(request.params));

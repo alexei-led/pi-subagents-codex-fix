@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { writeAtomicJson, writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { DIRS, type AsyncStatus, type Details, type SubagentState } from "../../shared/types.ts";
 import { updateActiveRunIndex } from "../background/active-run-index.ts";
 import { deliverStopRequest } from "../background/control-channel.ts";
@@ -147,7 +147,10 @@ export function stopAsyncRun(
 	}
 	try {
 		deliverStopRequest({ asyncDir: target.asyncDir, pid: typeof status.pid === "number" ? status.pid : undefined, kill, source: "stop-action", targetIndex: child?.index, childId: child?.id ?? childId });
-		if (!childId && status.kernelOperationDirectory) void requestKernelOwnedProcessCancellation(status.kernelOperationDirectory).catch((cause) => console.error("Kernel stop request failed:", cause));
+		if (!childId && status.kernelOperationDirectory) {
+			writePrivateAtomicJson(path.join(status.kernelOperationDirectory, "native-stop.json"), { runId: status.runId, requestedAt: Date.now() });
+			void requestKernelOwnedProcessCancellation(status.kernelOperationDirectory).catch((cause) => console.error("Kernel stop request failed:", cause));
+		}
 		if (pausedWholeRun) {
 			const failure = sealPausedRun(target.asyncDir, status);
 			if (failure) {

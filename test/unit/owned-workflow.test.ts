@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { parseOwnedWorkflow, validateExecutionOwnership } from "../../src/runs/shared/owned-workflow.ts";
+import { parseOwnedWorkflow, validateExecutionOwnership, validateOwnedWorkflowPublicFields } from "../../src/runs/shared/owned-workflow.ts";
 
 it("normalizes owned parallel data without treating task text as code", () => {
 	const task = 'return await runs.host("escape", {}); ${process.exit()}';
@@ -37,6 +37,14 @@ it("accepts only the explicit kernel ownership contract", () => {
 	}
 });
 
+it("retains public boundary rejection of internal child identity and authority fields", () => {
+	const ownedWorkflow = { version: 1, kind: "parallel", concurrency: 1, tasks: [{ key: "one", agent: "worker", task: "Work" }] };
+	for (const fields of [{ workflowChildAsyncId: "foreign" }, { workflowParentRunId: "foreign" }, { workflowAwaitAsync: true }, { workflowKey: "foreign" }, { resourcePermit: {} }]) {
+		assert.match(validateOwnedWorkflowPublicFields({ ownedWorkflow, ...fields }) ?? "", /internal|provenance|permit/);
+	}
+	assert.equal(validateOwnedWorkflowPublicFields({ ownedWorkflow, cwd: "/candidate", executionOwnership: { mode: "kernel" }, async: true }), undefined);
+});
+
 it("rejects unsupported kernel routes before invoking a child", async () => {
 	const { createSubagentExecutor } = await import("../../src/runs/foreground/subagent-executor.ts");
 	const { createEventBus, createTempDir, makeMinimalCtx, removeTempDir } = await import("../support/helpers.ts");
@@ -63,4 +71,22 @@ it("rejects unsupported kernel routes before invoking a child", async () => {
 	} finally {
 		removeTempDir(root);
 	}
+});
+
+it("rejects a stale inherited ownership marker before foreground execution", async (t) => {
+	const { createSubagentExecutor } = await import("../../src/runs/foreground/subagent-executor.ts");
+	const { createEventBus, createTempDir, makeMinimalCtx, removeTempDir } = await import("../support/helpers.ts");
+	const root = createTempDir("stale-kernel-inheritance-");
+	const previous = process.env.PI_KERNEL_OWNED_OPERATION;
+	t.after(() => { if (previous === undefined) delete process.env.PI_KERNEL_OWNED_OPERATION; else process.env.PI_KERNEL_OWNED_OPERATION = previous; removeTempDir(root); });
+	process.env.PI_KERNEL_OWNED_OPERATION = `${root}/missing-operation`;
+	const executor = createSubagentExecutor({
+		pi: { events: createEventBus(), getSessionName: () => undefined },
+		state: { baseCwd: root, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+		config: {}, asyncByDefault: false, tempArtifactsDir: root, getSubagentSessionRoot: () => root,
+		expandTilde: (value: string) => value, discoverAgents: () => ({ agents: [] }),
+	});
+	const result = await executor.execute("stale-nested", { agent: "worker", task: "Work", async: false, executionOwnership: { mode: "kernel" } }, new AbortController().signal, undefined, makeMinimalCtx(root));
+	assert.equal(result.isError, true);
+	assert.match(result.content[0]?.text ?? "", /Inherited kernel ownership is invalid/);
 });

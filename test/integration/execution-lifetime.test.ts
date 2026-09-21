@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { setImmediate } from "node:timers/promises";
 import { describe, it } from "node:test";
-import { makeAgent, makeMinimalCtx } from "../support/helpers.ts";
+import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
 import { installSingleExecutionHooks, makeExecutor, mockPi, tempDir } from "../support/single-execution-fixture.ts";
 
 const HALF_HOUR = 30 * 60 * 1000;
@@ -68,4 +68,24 @@ describe("execution lifetime at the executor boundary", () => {
 			assert.deepEqual(result.details.effectiveExecutionLifetime, lifetime ?? { mode: "bounded", timeoutMs: HALF_HOUR });
 		});
 	}
+
+	it("inherits unbounded lifetime through a nested executor beyond thirty minutes", async (t) => {
+		t.mock.timers.enable({ apis: ["Date", "setTimeout"], now: Date.now() });
+		mockPi.onCall({ delay: HALF_HOUR + 60_000, output: "nested child completed" });
+		const executor = makeExecutor([{ ...makeAgent("echo"), defaultTimeoutMs: 500 }], { timeoutMs: 200 }, false, undefined, true, new Map(), undefined, undefined, createEventBus(), undefined, {
+			fanoutChild: true, depth: 1, maxDepth: 3, waitTool: { enabled: true }, fast: false, executionLifetime: { mode: "unbounded" },
+		});
+		let settled = false;
+		const resultPromise = executor.execute("nested-unbounded", { agent: "echo", task: "Continue nested work", async: false, acceptance: false }, new AbortController().signal, undefined, makeMinimalCtx(tempDir)).finally(() => { settled = true; });
+		await flushUntil(() => mockPi.callCount() === 1);
+		await setImmediate();
+		t.mock.timers.tick(HALF_HOUR + 1);
+		await setImmediate();
+		assert.equal(settled, false);
+		assert.equal(mockPi.sessions[0]?.aborted, false);
+		assert.deepEqual(mockPi.sessions[0]?.launch.runtime.executionLifetime, { mode: "unbounded" });
+		t.mock.timers.tick(60_000);
+		await flushUntil(() => settled);
+		assert.equal((await resultPromise).isError, undefined);
+	});
 });

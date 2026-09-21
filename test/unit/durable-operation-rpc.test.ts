@@ -8,7 +8,7 @@ import { Compile } from "typebox/compile";
 import { createEventBus, makeMinimalCtx } from "../support/helpers.ts";
 import type { ExecutionLifetime } from "../../src/shared/types.ts";
 import { DurableOperation, type OperationIdentity } from "../../src/runs/background/durable-operation.ts";
-import { stopRequestsDir } from "../../src/runs/background/control-channel.ts";
+import { stopRequestsDir, consumeSteerRequests } from "../../src/runs/background/control-channel.ts";
 import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent, type SubagentRpcMethod } from "../../src/extension/rpc.ts";
 
 type Options = Parameters<typeof registerSubagentRpcBridge>[0];
@@ -25,11 +25,15 @@ interface OperationRequest extends OperationIdentity {
 	agent?: string;
 	task?: string;
 	executionLifetime?: ExecutionLifetime;
+	diagnosticId?: string;
+	toolCallId?: string;
+	message?: string;
 }
 
 const observationSchema = Type.Object({
 	runId: Type.Optional(Type.String()), state: Type.Optional(Type.String()), status: Type.Optional(Type.String()),
 	neverStarted: Type.Optional(Type.Boolean()), cancellationRequested: Type.Optional(Type.Boolean()),
+	diagnosticId: Type.Optional(Type.String()), guidanceOnly: Type.Optional(Type.Boolean()),
 	effectiveExecutionLifetime: Type.Optional(Type.Union([
 		Type.Object({ mode: Type.Literal("unbounded") }),
 		Type.Object({ mode: Type.Literal("bounded"), timeoutMs: Type.Number() }),
@@ -73,7 +77,7 @@ it("reconciles a lost spawn reply across session restart without a second dispat
 	try {
 		const started = await request(events, "spawn", launch);
 		original.dispose();
-		const restarted = registerSubagentRpcBridge({ ...options, getContext: () => context(root, "session-2") });
+		const restarted = registerSubagentRpcBridge({ ...options, getContext: () => context(path.join(root, "another-worktree"), "session-2") });
 		try {
 			const lookup = await request(events, "lookup", { operationId: launch.operationId, digest: launch.digest });
 			const replay = await request(events, "spawn", launch);
@@ -85,6 +89,25 @@ it("reconciles a lost spawn reply across session restart without a second dispat
 			await assert.rejects(request(events, "spawn", { ...launch, digest: "different" }), /digest/);
 		} finally { restarted.dispose(); }
 	} finally { original.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+it("arbitrates one operation identity across concurrent working-directory scopes", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "durable-global-scope-"));
+	try {
+		const first = new DurableOperation(root, path.join(root, "first-worktree"), "same-operation");
+		const second = new DurableOperation(root, path.join(root, "second-worktree"), "same-operation");
+		assert.equal(first.claim({ digest: "same-digest", requestHash: "same-params" }), true);
+		assert.equal(second.claim({ digest: "same-digest", requestHash: "same-params" }), false);
+		assert.equal(second.runId, first.runId);
+		assert.equal(second.directory, first.directory);
+		assert.throws(() => second.claim({ digest: "same-digest", requestHash: "changed-params" }), /does not match/);
+		const cancellation = new DurableOperation(root, path.join(root, "third-worktree"), "cancelled-operation");
+		cancellation.cancel("cancelled-digest");
+		const late = new DurableOperation(root, path.join(root, "fourth-worktree"), "cancelled-operation");
+		assert.equal(late.claim({ digest: "cancelled-digest", requestHash: "late" }), false);
+		assert.equal(late.cancelled(), true);
+		assert.equal(late.runId, cancellation.runId);
+	} finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 it("fences a delayed spawn before dispatch and retains the fence after restart", async () => {
@@ -169,4 +192,77 @@ it("stops persisted workflow children after restart loses the in-process control
 		assert.ok(fs.readdirSync(stopRequestsDir(childDir)).length > 0);
 		assert.equal(cancelled.processTerminalProof, undefined);
 	} finally { bridge.dispose(); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+function diagnosticFixture(state: "running" | "complete" = "running") {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "durable-diagnosis-"));
+	const operation = new DurableOperation(root, root, launch.operationId);
+	operation.claim({ digest: launch.digest, sessionId: "session-1" });
+	const asyncDir = path.join(root, operation.runId);
+	fs.mkdirSync(asyncDir);
+	fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+		runId: operation.runId, sessionId: "session-1", mode: "single", state, startedAt: 1,
+		runnerPhase: "model_stream", steps: [{ agent: "worker", status: state === "running" ? "running" : "complete", runnerPhase: "model_stream", lastToolFailure: { kind: "tool-execution-error", toolCallId: "failed-call", toolName: "bash", observedAt: 10, message: "command failed" } }],
+	}));
+	const events = createEventBus();
+	const options: Options = { events, asyncDirRoot: root, getContext: () => context(root), execute: async () => assert.fail("diagnosis must not spawn or revive") };
+	return { root, operation, asyncDir, events, options };
+}
+
+const diagnosis = { operationId: launch.operationId, digest: launch.digest, diagnosticId: "diagnostic-1", toolCallId: "failed-call", message: "Inspect the confirmed command error and use another approach." };
+
+it("queues confirmed-failure guidance once across reply loss and restart without changing the current phase", async () => {
+	const fixture = diagnosticFixture();
+	let bridge = registerSubagentRpcBridge(fixture.options);
+	try {
+		const receipt = await request(fixture.events, "diagnose", diagnosis);
+		assert.equal(receipt.state, "queued");
+		assert.equal(receipt.guidanceOnly, true);
+		const controls = consumeSteerRequests(fixture.asyncDir);
+		assert.equal(controls.length, 1);
+		assert.equal(controls[0]?.mode, "follow_up");
+		assert.match(controls[0]?.id ?? "", /^diagnostic-[0-9a-f]{64}$/);
+		bridge.dispose();
+		bridge = registerSubagentRpcBridge({ ...fixture.options, getContext: () => context(fixture.root, "new-session") });
+		assert.equal((await request(fixture.events, "diagnose", diagnosis)).state, "queued");
+		assert.deepEqual(consumeSteerRequests(fixture.asyncDir), []);
+		assert.equal(JSON.parse(fs.readFileSync(path.join(fixture.asyncDir, "status.json"), "utf8")).runnerPhase, "model_stream");
+		await assert.rejects(request(fixture.events, "diagnose", { ...diagnosis, message: "Changed request" }), /do not match/);
+	} finally { bridge.dispose(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+it("does not replay an ambiguous diagnostic enqueue", async () => {
+	const fixture = diagnosticFixture();
+	fixture.operation.claimDiagnostic({ diagnosticId: diagnosis.diagnosticId, toolCallId: diagnosis.toolCallId, message: diagnosis.message });
+	const bridge = registerSubagentRpcBridge(fixture.options);
+	try {
+		assert.equal((await request(fixture.events, "diagnose", diagnosis)).state, "pending");
+		assert.equal((await request(fixture.events, "diagnose", diagnosis)).state, "pending");
+		assert.deepEqual(consumeSteerRequests(fixture.asyncDir), []);
+	} finally { bridge.dispose(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+it("bounds transport filenames for long opaque diagnostic identifiers", async () => {
+	const fixture = diagnosticFixture();
+	const bridge = registerSubagentRpcBridge(fixture.options);
+	try {
+		const diagnosticId = "long diagnostic id ".repeat(13);
+		assert.equal((await request(fixture.events, "diagnose", { ...diagnosis, diagnosticId })).state, "queued");
+		const controls = consumeSteerRequests(fixture.asyncDir);
+		assert.equal(controls.length, 1);
+		assert.match(controls[0]?.id ?? "", /^diagnostic-[0-9a-f]{64}$/);
+		assert.equal((await request(fixture.events, "diagnose", { ...diagnosis, diagnosticId })).state, "queued");
+		assert.deepEqual(consumeSteerRequests(fixture.asyncDir), []);
+	} finally { bridge.dispose(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
+});
+
+for (const reason of ["cancelled", "terminal", "unconfirmed"] as const) it(`rejects diagnostic guidance for ${reason} work`, async () => {
+	const fixture = diagnosticFixture(reason === "terminal" ? "complete" : "running");
+	if (reason === "cancelled") fixture.operation.cancel(launch.digest);
+	const bridge = registerSubagentRpcBridge(fixture.options);
+	try {
+		const receipt = await request(fixture.events, "diagnose", { ...diagnosis, toolCallId: reason === "unconfirmed" ? "healthy-call" : diagnosis.toolCallId });
+		assert.equal(receipt.state, reason === "cancelled" ? "cancelled" : "rejected");
+		assert.deepEqual(consumeSteerRequests(fixture.asyncDir), []);
+	} finally { bridge.dispose(); fs.rmSync(fixture.root, { recursive: true, force: true }); }
 });

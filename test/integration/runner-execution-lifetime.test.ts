@@ -13,7 +13,7 @@ async function flushUntil(predicate: () => boolean): Promise<void> {
 	assert.ok(predicate(), "runner did not reach the expected boundary");
 }
 
-for (const mode of ["unbounded", "bounded", "omitted"] as const) {
+for (const mode of ["unbounded", "parallel-unbounded", "bounded", "omitted"] as const) {
 	it(`runs the native background runner with ${mode} execution lifetime across the thirty minute boundary`, async (t) => {
 		const dir = createTempDir("runner-lifetime-");
 		t.after(() => removeTempDir(dir));
@@ -21,9 +21,10 @@ for (const mode of ["unbounded", "bounded", "omitted"] as const) {
 		const halfHour = 30 * 60 * 1000;
 		fs.writeFileSync(path.join(dir, "default-response.json"), JSON.stringify({ delay: halfHour + 60_000, output: "long-running child completed" }));
 		const children = createFakeChildSessions(() => dir);
-		const executionLifetime = mode === "omitted" ? undefined : mode === "unbounded" ? { mode } : { mode, timeoutMs: halfHour };
+		const unbounded = mode === "unbounded" || mode === "parallel-unbounded";
+		const executionLifetime = mode === "omitted" ? undefined : unbounded ? { mode: "unbounded" as const } : { mode: "bounded" as const, timeoutMs: halfHour };
 		const built = buildAsyncRunnerSteps("runner-lifetime", {
-			chain: [{ agent: "echo", task: "continue", acceptance: false }], agents: [makeAgent("echo")],
+			chain: mode === "parallel-unbounded" ? [{ parallel: [{ agent: "echo", task: "first", acceptance: false }, { agent: "echo", task: "second", acceptance: false }], concurrency: 2 }] : [{ agent: "echo", task: "continue", acceptance: false }], agents: [makeAgent("echo")],
 			ctx: { cwd: dir, currentSessionId: "lifetime-session", currentModel: undefined, currentModelProvider: undefined, modelScope: undefined },
 			asyncDir: dir, maxSubagentDepth: 2, executionLifetime,
 		});
@@ -34,11 +35,11 @@ for (const mode of ["unbounded", "bounded", "omitted"] as const) {
 			id: "runner-lifetime", sessionId: "lifetime-session", steps: built.steps, cwd: dir, asyncDir: dir, resultPath, placeholder: "", artifactConfig: { enabled: false },
 			executionLifetime,
 		}, children.factory).finally(() => { settled = true; });
-		await flushUntil(() => Boolean(children.sessions[0]?.task));
+		await flushUntil(() => mode === "parallel-unbounded" ? children.sessions.filter((session) => Boolean(session.task)).length === 2 : Boolean(children.sessions[0]?.task));
 		await setImmediate();
 		t.mock.timers.tick(halfHour + 1);
 		await setImmediate();
-		if (mode === "unbounded") {
+		if (unbounded) {
 			assert.equal(settled, false);
 			assert.equal(children.sessions[0]?.aborted, false);
 			assert.deepEqual(children.sessions[0]?.launch.runtime.executionLifetime, { mode: "unbounded" });
@@ -48,9 +49,9 @@ for (const mode of ["unbounded", "bounded", "omitted"] as const) {
 		await promise;
 		const result = JSON.parse(fs.readFileSync(resultPath, "utf8"));
 		const status = JSON.parse(fs.readFileSync(path.join(dir, "status.json"), "utf8"));
-		assert.equal(result.success, mode === "unbounded", JSON.stringify(result));
+		assert.equal(result.success, unbounded, JSON.stringify(result));
 		assert.deepEqual(status.effectiveExecutionLifetime, executionLifetime ?? { mode: "unbounded" });
-		if (mode === "unbounded") {
+		if (unbounded) {
 			assert.equal(status.deadlineAt, undefined);
 			assert.equal(status.timeoutMs, undefined);
 		} else assert.equal(children.sessions[0]?.aborted, true);

@@ -13,6 +13,7 @@ export const FULL_PROCESS_TREE_OWNERSHIP = { version: 1, scope: "owned-process-t
 const bindingSchema = Type.Object({ operationId: Type.String(), requestDigest: Type.String(), hostId: Type.String(), bootId: Type.String() });
 const nativeOperationSchema = Type.Object({ operationId: Type.String(), digest: Type.String() });
 const nativeIntentValidator = Compile(Type.Object({ operationId: Type.String(), digest: Type.String(), runId: Type.String(), kind: Type.Literal("launch") }));
+const nativeStopValidator = Compile(Type.Object({ runId: Type.String(), requestedAt: Type.Number() }));
 const mappingValidator = Compile(Type.Object({ version: Type.Literal(1), runId: Type.String(), runnerProcessInstanceId: Type.String(), asyncDir: Type.String(), kernelBinding: bindingSchema, nativeOperation: Type.Optional(nativeOperationSchema) }));
 const processIdentitySchema = Type.Object({ pid: Type.Integer({ minimum: 1 }), uniqueId: Type.String({ minLength: 1 }), pidVersion: Type.Integer({ minimum: 0 }) });
 const identitySchema = Type.Object({ ...bindingSchema.properties, version: Type.Literal(1), backend: Type.Literal("darwin-resource-coalition-v1"), coalitionId: Type.String({ minLength: 1 }), leader: processIdentitySchema });
@@ -104,9 +105,14 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 	const mapping = readNativeKernelMapping(operationDirectory, runId);
 	let observation = await observeKernelOwnedProcess(operationDirectory);
 	const status = mapping ? readStatus(mapping.asyncDir) : null;
+	let nativeStopRequested = false;
+	try {
+		const stop: unknown = JSON.parse(fs.readFileSync(path.join(operationDirectory, "native-stop.json"), "utf8"));
+		nativeStopRequested = nativeStopValidator.Check(stop) && stop.runId === runId;
+	} catch {}
 	const runnerFailed = Boolean(observation.signal) || (observation.exitCode !== undefined && observation.exitCode !== null && observation.exitCode !== 0)
 		|| (observation.exitCode === 0 && (!status || status.state === "running" || status.state === "queued"));
-	if (mapping && (runnerFailed || status?.stopped === true) && observation.status === "active") observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
+	if (mapping && (runnerFailed || nativeStopRequested || status?.stopped === true) && observation.status === "active") observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
 	let proof: NativeKernelTerminalProof = { version: 1, state: "unknown", runId, runnerProcessInstanceId: mapping?.runnerProcessInstanceId ?? "unknown", reason: "Kernel ownership mapping or retirement evidence is unavailable." };
 	const binding = mapping?.kernelBinding;
 	const kernelProof = observation.proof;
@@ -127,11 +133,12 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 	if (proof.state === "observed" && mapping) {
 		writePrivateAtomicJson(path.join(mapping.asyncDir, "process-terminal.json"), proof);
 		if (status) {
-			const stopRequested = status.stopped === true || fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json"));
+			const stopRequested = nativeStopRequested || status.stopped === true || fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json"));
 			writePrivateAtomicJson(path.join(mapping.asyncDir, "status.json"), {
 				...status, processTerminal: proof,
 				state: stopRequested ? "stopped" : runnerFailed ? "failed" : status.state,
 				stopped: stopRequested || status.stopped,
+				steps: stopRequested ? status.steps?.map((step) => step.status === "running" || step.status === "pending" ? { ...step, status: "stopped", stopped: true, endedAt: Date.now() } : step) : status.steps,
 				endedAt: status.endedAt ?? Date.now(),
 				lastUpdate: Date.now(),
 			});

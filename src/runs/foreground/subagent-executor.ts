@@ -1,4 +1,4 @@
-import { parseOwnedWorkflow, validateExecutionOwnership } from "../shared/owned-workflow.ts";
+import { parseOwnedWorkflow, validateExecutionOwnership, validateOwnedWorkflowPublicFields } from "../shared/owned-workflow.ts";
 import { writeWorkflowDispatchClosed } from "../background/workflow-terminal.ts";
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
@@ -7585,7 +7585,12 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<Details>> => {
-		if (params.ownedWorkflow !== undefined) return executeWithSingleDispatchGuard(id, params, signal, onUpdate, ctx);
+		if (params.ownedWorkflow !== undefined) {
+			const error = validateOwnedWorkflowPublicFields(params);
+			if (error) return Promise.resolve(buildRequestedModeError(params, error));
+			publicExecutions.add(params);
+			return executeWithSingleDispatchGuard(id, params, signal, onUpdate, ctx);
+		}
 		const normalized = normalizePublicSubagentExecution(params);
 		if (!normalized.ok) {
 			return Promise.resolve({ content: [{ type: "text", text: normalized.error }], isError: true, details: { mode: normalized.mode, results: [] } });

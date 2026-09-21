@@ -1,5 +1,5 @@
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
-import type { ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
+import type { ExecutionLifetime, ExecutionOwnership, ProcessTerminal } from "../../shared/types.ts";
 import { launchKernelOwnedProcess, prepareKernelOwnedProcess, cancelKernelOwnedProcess, inspectKernelOwnedProcessMembership, type KernelOwnedProcessRequest } from "../../api/kernel-owned-process.mjs";
 import { observeNativeKernelRun, writeNativeKernelMapping } from "./runtime-ownership.ts";
 /**
@@ -32,7 +32,7 @@ import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
 import { resolveNodeExecutable } from "../../shared/node-executable.ts";
 import { backgroundProcessOptions } from "../shared/background-process-options.ts";
 import { normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
-import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
+import { getAgentDir, PI_CODING_AGENT_PACKAGE_ROOT_ENV, PROMPT_REDACTED, resolveChildCwd } from "../../shared/utils.ts";
 import { resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, resolveSubagentModelOverride, type AvailableModelInfo, type ModelOrigin, type ParentModel } from "../shared/model-resolution.ts";
 import { resolveToolTimeoutMs, toolTimeoutFromEnv } from "../shared/tool-timeout.ts";
 import { resolveModelScopesForAgent, type ModelScopeConfig } from "../shared/model-scope.ts";
@@ -684,7 +684,7 @@ interface KernelRunnerLaunch {
 	initialStatusPath: string;
 	startupProceedPath: string;
 	onBeforeProceed?: (runnerProcessInstanceId: string) => void;
-	onProcessTerminal?: (proof: unknown) => void;
+	onProcessTerminal?: (proof: ProcessTerminal) => void;
 }
 
 async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunnerResult> {
@@ -849,14 +849,14 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 			if (hasRevivalLease) return { error: "Kernel-owned runner revival requires a fresh correlated operation after verified retirement." };
 			if (!launchAsyncDir || !startupProceedPath) return { error: "Kernel-owned runner requires a durable startup barrier." };
 			const lifetime = ownershipConfig.effectiveExecutionLifetime ?? { mode: "unbounded" };
-			const operationDirectory = ownershipConfig.kernelOperationDirectory ?? path.join(cwd, ".pi", "subagent-runtime", "owned", launchRunId);
+			const operationDirectory = ownershipConfig.kernelOperationDirectory ?? path.join(getAgentDir(), "subagent-runtime", "owned", launchRunId);
 			writePrivateAtomicJson(cfgPath, { ...launchConfig, kernelOperationDirectory: operationDirectory });
 			const env: Record<string, string> = {};
 			for (const [key, value] of Object.entries(runnerEnv)) if (value !== undefined) env[key] = value;
 			return spawnKernelRunner({
 				request: {
 					operationDirectory,
-					artifactDirectory: path.join(cwd, ".pi", "subagent-runtime", "kernel"),
+					artifactDirectory: path.join(path.dirname(operationDirectory), "kernel-cache"),
 					argv: [command, ...args], cwd, env,
 					lifetime: lifetime.mode === "unbounded" ? { kind: "unbounded" } : { kind: "bounded", timeoutMs: lifetime.timeoutMs },
 				},

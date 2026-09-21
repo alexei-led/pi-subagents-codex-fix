@@ -16,7 +16,7 @@ Control requests and explicitly budgeted host commands retain their own timeouts
 
 RPC `ping` advertises `executionLifetime: { version: 1, modes: ["unbounded",
 "bounded"] }`, `durableOperations: { version: 1, lookup: true, replay: true,
-cancelFence: true, scope: "repository" }`, and `workflowTerminalProof: { version: 1 }`.
+cancelFence: true, scope: "runtime" }`, and `workflowTerminalProof: { version: 1 }`.
 
 Request kernel-owned execution with `executionOwnership: { mode: "kernel" }`.
 On a supported macOS host, bounded preflight verifies the resource-coalition
@@ -41,16 +41,20 @@ an immutable intent and allocates the run ID before dispatch. Repeating the same
 identity returns the saved response or a pending observation. It never dispatches
 another child. Changing the digest or launch parameters is rejected.
 
-`lookup({ operationId, digest })` works across sessions in the same repository
-scope. Its response contains `state` (`absent`, `pending`, `found`, or `cancelled`),
+`lookup({ operationId, digest })` works across sessions and working-directory
+changes within the same private runtime store. Its response contains `state`
+(`absent`, `pending`, `found`, or `cancelled`),
 the identity, `runId`, `asyncDir`, and `effectiveExecutionLifetime` when known.
 `statusPayload` contains the persisted native status, including workflow output
 and child steps. `activity` exposes recorded tool/process observations; silence is
 not proof of a stalled or exited child.
 
-Intent records live under the working directory's `.pi/subagent-runtime/`, outside
-the temporary runner directories. The scope is the extension context's working
-directory. Kernel admission records and native-to-kernel identity mappings share
+Intent records live in the configured private operation root, defaulting to the
+agent state directory's `subagent-runtime/`. Compiler caches live beside private
+operation artifacts. Neither is written into the candidate checkout. A global
+operation-ID reservation freezes the original working-directory scope and run ID;
+changing context cannot make a prior launch disappear or authorize a duplicate.
+Kernel admission records and native-to-kernel identity mappings share
 the persistent operation directory. An unresolved launch intent remains pending
 when no runner evidence exists. A control timeout, missing
 status file, or stale session never permits a second dispatch for that identity.
@@ -91,3 +95,18 @@ but this does not remove the containment limitation.
 
 Neither proof authorizes treating a failed task as successful. They establish
 quiescence so the caller can safely decide what to run next.
+
+## Confirmed tool-failure guidance
+
+Native SDK error events persist `activity.lastToolFailure` with the exact tool call
+ID, tool name, observation time, and a sanitized message. Successful output that
+contains error-like text and elapsed silence do not create this evidence.
+
+`diagnose({ operationId, digest, diagnosticId, toolCallId, message })` can enqueue
+follow-up guidance for that confirmed failure in a live child session. It never
+revives a session, interrupts a healthy tool, or launches another worker. The
+durable diagnostic ID permits at most one enqueue. Replays return `queued`,
+`pending`, `cancelled`, or `rejected` with `guidanceOnly: true`; changed payloads
+are rejected. A crash between claim and acknowledgement remains pending and does
+not cause a repeated enqueue. Queued guidance is not evidence that the tool fault
+was repaired. Cancellation is checked again immediately before enqueue.
