@@ -51,6 +51,7 @@ interface BoundaryState {
   members: { pid: number; uniqueId: string; pidVersion: number }[];
   delayCommand?: string;
   delayMs?: number;
+  retirementRecords?: ("exit" | "timeout")[];
 }
 
 function fixture(t: TestContext, lifetime: Lifetime = { kind: "unbounded" }) {
@@ -342,3 +343,39 @@ test("retirement before lifetime expiry does not invent timeout on later observa
     false,
   );
 });
+
+for (const outcome of ["success", "failure", "timeout", "corrupt-exit", "corrupt-timeout", "missing"] as const) {
+  test(`retirement refreshes final workload metadata published during the kernel query (${outcome})`, async (t) => {
+    const operation = fixture(t);
+    operation.admit();
+    operation.state.coalition = { ok: false, errno: 3, error: "retired" };
+    operation.state.retirementRecords = [];
+    if (outcome !== "missing") {
+      publishRecord(path.join(operation.directory, "pending-exit.json"), {
+        ...binding(operation.envelope), exitCode: outcome === "failure" ? 7 : 0,
+        signal: null, timedOut: false, observedAt: new Date().toISOString(),
+      });
+      operation.state.retirementRecords.push("exit");
+    }
+    if (outcome === "timeout" || outcome === "corrupt-timeout") {
+      publishRecord(path.join(operation.directory, "pending-timeout.json"), {
+        ...binding(operation.envelope), observedAt: new Date().toISOString(),
+      });
+      operation.state.retirementRecords.push("timeout");
+    }
+    if (outcome === "corrupt-exit" || outcome === "corrupt-timeout") {
+      fs.writeFileSync(path.join(operation.directory, `pending-${outcome === "corrupt-exit" ? "exit" : "timeout"}.json`), "{}");
+    }
+    operation.save();
+    const observation = await observeKernelOwnedProcess(operation.directory);
+    if (outcome === "corrupt-exit" || outcome === "corrupt-timeout") {
+      assert.equal(observation.status, "unknown");
+      assert.equal(observation.proof, undefined);
+    } else {
+      assert.equal(observation.status, "retired");
+      assert.equal(observation.proof?.kind, "darwin-coalition-retired");
+      assert.equal(observation.exitCode, outcome === "missing" ? undefined : outcome === "failure" ? 7 : 0);
+      assert.equal(observation.timedOut, outcome === "missing" ? undefined : outcome === "timeout");
+    }
+  });
+}

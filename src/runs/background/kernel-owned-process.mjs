@@ -356,8 +356,9 @@ async function observeOperation(operationDirectory) {
         proof: { kind: "never-started", ...binding(envelope), observedAt: decision.observedAt },
       };
     const workload = optionalJson(path.join(directory, "workload.json"));
-    const exit = optionalJson(path.join(directory, "exit.json"));
-    let timeout = optionalJson(path.join(directory, "timeout.json"));
+    const completion = readWorkloadCompletion(directory, envelope);
+    const exit = completion.exit;
+    let timeout = completion.timeout;
     if (
       workload !== undefined &&
       (!validRecord(workload) ||
@@ -366,21 +367,6 @@ async function observeOperation(operationDirectory) {
         !isTimestamp(workload.observedAt))
     )
       throw new Error("workload-identity-invalid");
-    if (
-      exit !== undefined &&
-      (!validRecord(exit) ||
-        !bound(exit, envelope) ||
-        (exit.exitCode !== null && !Number.isSafeInteger(exit.exitCode)) ||
-        (exit.signal !== null && !isString(exit.signal)) ||
-        !isBoolean(exit.timedOut) ||
-        !isTimestamp(exit.observedAt))
-    )
-      throw new Error("workload-exit-invalid");
-    if (
-      timeout !== undefined &&
-      (!validRecord(timeout) || !bound(timeout, envelope) || !isTimestamp(timeout.observedAt))
-    )
-      throw new Error("workload-timeout-invalid");
     const details = { ...base, identity: decision.identity };
     if (workload) details.workloadIdentity = workload.identity;
     if (exit) {
@@ -439,8 +425,14 @@ async function observeOperation(operationDirectory) {
     }
     if (observed.errno !== 3)
       return { ...details, status: "unknown", reason: "coalition-observation-failed" };
+    const finalCompletion = readWorkloadCompletion(directory, envelope);
     return {
       ...details,
+      exitCode: finalCompletion.exit?.exitCode,
+      signal: finalCompletion.exit?.signal,
+      timedOut: finalCompletion.exit
+        ? finalCompletion.exit.timedOut || finalCompletion.timeout !== undefined
+        : finalCompletion.timeout !== undefined ? true : undefined,
       status: "retired",
       proof: {
         kind: "darwin-coalition-retired",
@@ -468,6 +460,27 @@ async function observeOperation(operationDirectory) {
       reason: reasons.has(error.message) ? error.message : "owned-operation-unavailable",
     };
   }
+}
+
+function readWorkloadCompletion(directory, envelope) {
+  const exit = optionalJson(path.join(directory, "exit.json"));
+  const timeout = optionalJson(path.join(directory, "timeout.json"));
+  if (
+    exit !== undefined &&
+    (!validRecord(exit) ||
+      !bound(exit, envelope) ||
+      (exit.exitCode !== null && !Number.isSafeInteger(exit.exitCode)) ||
+      (exit.signal !== null && !isString(exit.signal)) ||
+      !isBoolean(exit.timedOut) ||
+      !isTimestamp(exit.observedAt))
+  )
+    throw new Error("workload-exit-invalid");
+  if (
+    timeout !== undefined &&
+    (!validRecord(timeout) || !bound(timeout, envelope) || !isTimestamp(timeout.observedAt))
+  )
+    throw new Error("workload-timeout-invalid");
+  return { exit, timeout };
 }
 
 export async function inspectKernelOwnedProcessMembership(operationDirectory, pid = process.pid) {

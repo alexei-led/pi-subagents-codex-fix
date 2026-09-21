@@ -40,6 +40,8 @@ if (command === "admission-race") {
       };
       break;
     case "coalition":
+      for (const name of state.retirementRecords ?? [])
+        fs.renameSync(path.join(directory, `pending-${name}.json`), path.join(directory, `${name}.json`));
       result = state.coalition;
       break;
     case "members":
