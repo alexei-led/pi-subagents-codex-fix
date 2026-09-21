@@ -4031,7 +4031,7 @@ export async function runSubagent(
 						baseRef: config.baseRef,
 						branchPrefix: config.worktreeBranchPrefix,
 						setupHook: config.worktreeSetupHook
-							? omitUndefinedProperties({ hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs })
+							? omitUndefinedProperties({ hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs ?? (config.executionLifetime?.mode === "unbounded" ? false : undefined) })
 							: undefined,
 						baseDir: config.worktreeBaseDir,
 						onProgress: (progress) => {
@@ -4470,7 +4470,7 @@ export async function runSubagent(
 						baseRef: config.baseRef,
 						branchPrefix: config.worktreeBranchPrefix,
 						setupHook: config.worktreeSetupHook
-							? omitUndefinedProperties({ hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs })
+							? omitUndefinedProperties({ hookPath: config.worktreeSetupHook, timeoutMs: config.worktreeSetupHookTimeoutMs ?? (config.executionLifetime?.mode === "unbounded" ? false : undefined) })
 							: undefined,
 						baseDir: config.worktreeBaseDir,
 						onProgress: (progress) => {

@@ -32,7 +32,7 @@ import { readProcessTerminal } from "../runs/background/process-terminal.ts";
 import { readWorkflowTerminalProof } from "../runs/background/workflow-terminal.ts";
 import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, readNativeKernelMapping, probeRuntimeOwnership, currentNativeLauncherOwner, nativeLauncherGone } from "../runs/background/runtime-ownership.ts";
 import { cancelKernelOwnedProcess, type KernelOwnedProcessCapability } from "../api/kernel-owned-process.mjs";
-import { parseOwnedWorkflow, validateOwnedWorkflowPublicFields } from "../runs/shared/owned-workflow.ts";
+import { parseOwnedWorkflow, normalizeOwnedWorkflowPublicFields } from "../runs/shared/owned-workflow.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
@@ -539,9 +539,9 @@ function spawnParams(params: unknown): SubagentParamsLike {
 		if (!parsed.ok) throw new SubagentRpcError("invalid_params", parsed.error);
 		// SAFETY: root fields are checked before dispatch; preserve the validated public data route through executePublic.
 		const request = { ...input, ownedWorkflowKeys: parsed.keys, async: true } as SubagentParamsLike;
-		const error = validateOwnedWorkflowPublicFields(request);
-		if (error) throw new SubagentRpcError("invalid_params", error);
-		return request;
+		const normalized = normalizeOwnedWorkflowPublicFields(request);
+		if (!normalized.ok) throw new SubagentRpcError("invalid_params", normalized.error);
+		return normalized.params;
 	}
 	const normalized = normalizePublicSubagentExecution(input);
 	if (!normalized.ok) throw new SubagentRpcError("invalid_params", normalized.error);

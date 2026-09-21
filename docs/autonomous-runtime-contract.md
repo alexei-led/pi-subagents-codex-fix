@@ -36,6 +36,14 @@ job providers, and top-level foreground requests are unsupported by this strict
 route. Nested processes inherit the root only after actual kernel membership has
 been verified.
 
+Owned parallel launches honor the effective worktree setting and the `isolation`
+alias. Explicit false or `isolation: "none"` overrides configuration defaults.
+Allocation and setup hooks run inside the owned root; each isolated child receives
+its own cwd, while root status retains the source cwd and the handoff records child
+paths, branches, and base commit. An omitted base ref resolves the source HEAD.
+Explicit unbounded execution disables the implicit setup-hook deadline; an
+explicitly configured hook command budget remains enforced.
+
 The inherited environment marker is a JSON descriptor containing the operation
 directory and its operation ID, request digest, host ID, and boot ID. Nested
 launches validate every binding field and the current process's actual coalition

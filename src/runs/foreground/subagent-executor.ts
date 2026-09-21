@@ -1,4 +1,4 @@
-import { parseOwnedWorkflow, validateExecutionOwnership, validateOwnedWorkflowPublicFields } from "../shared/owned-workflow.ts";
+import { parseOwnedWorkflow, validateExecutionOwnership, normalizeOwnedWorkflowPublicFields } from "../shared/owned-workflow.ts";
 import { writeWorkflowDispatchClosed } from "../background/workflow-terminal.ts";
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime, ExecutionOwnership } from "../../shared/types.ts";
@@ -3389,7 +3389,7 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			outputMode: task.outputMode, progress: task.progress, acceptance: task.acceptance,
 		}));
 		const result = await executeAsyncChain(id, compactOptional<Parameters<typeof executeAsyncChain>[1]>({
-			chain: [{ parallel, concurrency: params.concurrency }], resultMode: "parallel", ownedWorkflowKeys: params.ownedWorkflowKeys,
+			chain: [{ parallel, concurrency: params.concurrency, worktree: params.worktree }], resultMode: "parallel", ownedWorkflowKeys: params.ownedWorkflowKeys,
 			executionOwnership: params.executionOwnership, kernelOperationDirectory: params.rpcKernelOperationDirectory,
 			executionLifetime: params.executionLifetime, timeoutMs: data.timeoutMs,
 			agents, unknownAgentDiagnosticContext, ctx: asyncCtx, availableModels, cwd: effectiveCwd,
@@ -3403,6 +3403,12 @@ async function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 			callToolTimeoutMs: params.toolTimeoutMs, configToolTimeoutMs: data.configToolTimeoutMs,
 			capabilityCeiling: data.capabilityCeiling, runFanoutBudget: data.runFanoutBudget,
 			globalConcurrencyLimit: deps.config.globalConcurrencyLimit,
+			worktreeSetupHook: deps.config.worktreeSetupHook,
+			worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
+			worktreeBaseDir: deps.config.worktreeBaseDir,
+			baseRef: params.baseRef,
+			worktreeProvider: deps.config.worktreeProvider,
+			worktreeBranchPrefix: deps.config.worktreeBranchPrefix,
 		}));
 		if (params.ownedWorkflowKeys) result.details.ownedWorkflowKeys = params.ownedWorkflowKeys;
 		return result;
@@ -3525,7 +3531,7 @@ async function createSingleWorktreeSetup(
 	runId: string,
 	agent: string,
 	setupHook: ExtensionConfig["worktreeSetupHook"],
-	setupHookTimeoutMs: ExtensionConfig["worktreeSetupHookTimeoutMs"],
+	setupHookTimeoutMs: ExtensionConfig["worktreeSetupHookTimeoutMs"] | false,
 	baseDir: ExtensionConfig["worktreeBaseDir"],
 	baseRef: string | undefined,
 	provider: ExtensionConfig["worktreeProvider"],
@@ -3950,7 +3956,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		runId,
 		params.agent!,
 		deps.config.worktreeSetupHook,
-		deps.config.worktreeSetupHookTimeoutMs,
+		deps.config.worktreeSetupHookTimeoutMs ?? (params.executionLifetime?.mode === "unbounded" ? false : undefined),
 		deps.config.worktreeBaseDir,
 		params.baseRef,
 		deps.config.worktreeProvider,
@@ -7601,10 +7607,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		ctx: ExtensionContext,
 	): Promise<AgentToolResult<Details>> => {
 		if (params.ownedWorkflow !== undefined) {
-			const error = validateOwnedWorkflowPublicFields(params);
-			if (error) return Promise.resolve(buildRequestedModeError(params, error));
-			publicExecutions.add(params);
-			return executeWithSingleDispatchGuard(id, params, signal, onUpdate, ctx);
+			const normalized = normalizeOwnedWorkflowPublicFields(params);
+			if (!normalized.ok) return Promise.resolve(buildRequestedModeError(params, normalized.error));
+			publicExecutions.add(normalized.params);
+			return executeWithSingleDispatchGuard(id, normalized.params, signal, onUpdate, ctx);
 		}
 		const normalized = normalizePublicSubagentExecution(params);
 		if (!normalized.ok) {

@@ -62,7 +62,15 @@ export function validateExecutionOwnership(value: unknown): string | undefined {
 }
 
 export function validateOwnedWorkflowPublicFields(params: SubagentParamsLike): string | undefined {
+	const normalized = normalizeOwnedWorkflowPublicFields(params);
+	return normalized.ok ? undefined : normalized.error;
+}
+
+export function normalizeOwnedWorkflowPublicFields(params: SubagentParamsLike): { ok: true; params: SubagentParamsLike } | { ok: false; error: string } {
+	if (params.agent !== undefined || params.task !== undefined || params.tasks !== undefined || params.chain !== undefined || params.action !== undefined) return { ok: false, error: "ownedWorkflow cannot be combined with agent, task, tasks, chain, or management actions." };
 	const { ownedWorkflow: _ownedWorkflow, ...root } = params;
 	const validated = normalizePublicSubagentExecution({ ...root, agent: "owned-workflow-validation", task: "Validate structured launch fields." });
-	return validated.ok ? undefined : validated.error;
+	if (!validated.ok) return { ok: false, error: validated.error };
+	const { agent: _agent, task: _task, ...normalized } = validated.params;
+	return { ok: true, params: { ...normalized, ownedWorkflow: params.ownedWorkflow } };
 }

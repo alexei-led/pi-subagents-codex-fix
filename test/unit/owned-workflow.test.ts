@@ -1,6 +1,20 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { parseOwnedWorkflow, validateExecutionOwnership, validateOwnedWorkflowPublicFields } from "../../src/runs/shared/owned-workflow.ts";
+import { parseOwnedWorkflow, validateExecutionOwnership, validateOwnedWorkflowPublicFields, normalizeOwnedWorkflowPublicFields } from "../../src/runs/shared/owned-workflow.ts";
+
+it("preserves normalized isolation policy without losing the structured workflow", () => {
+	const ownedWorkflow = { version: 1, kind: "parallel", concurrency: 1, tasks: [{ key: "one", agent: "worker", task: "Work" }] };
+	for (const isolation of ["worktree", "none"]) {
+		const input = { ownedWorkflow, isolation, executionOwnership: { mode: "kernel" as const }, async: true };
+		const result = normalizeOwnedWorkflowPublicFields(input);
+		assert.equal(result.ok, true);
+		if (!result.ok) return;
+		assert.equal(result.params.worktree, isolation === "worktree");
+		assert.equal(result.params.ownedWorkflow, ownedWorkflow);
+		assert.equal(result.params.agent, undefined);
+		assert.equal(Object.hasOwn(result.params, "isolation"), false);
+	}
+});
 
 it("normalizes owned parallel data without treating task text as code", () => {
 	const task = 'return await runs.host("escape", {}); ${process.exit()}';
