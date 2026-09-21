@@ -666,6 +666,7 @@ function persistPreProceedStartupFailure(asyncDir: string, runId: string, runner
 
 interface SpawnRunnerResult {
 	pid?: number;
+	kernelPending?: boolean;
 	runnerProcessInstanceId?: string;
 	error?: string;
 	terminationObserved?: boolean;
@@ -701,15 +702,15 @@ async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunner
 		}
 		initializeProcessTerminal(input.asyncDir, input.runId, input.runnerProcessInstanceId);
 		input.onBeforeProceed?.(input.runnerProcessInstanceId);
-		const handle = await launchKernelOwnedProcess(input.request);
-		const pid = handle.workloadIdentity?.pid;
-		if (!pid) return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: handle.observation.reason ?? `Kernel runner did not start (${handle.observation.status}).`, startupDidNotProceed: true };
 		writePrivateAtomicJson(input.initialStatusPath, {
-			...input.initialStatus, pid, kernelOperationDirectory: prepared.operationDirectory, effectiveExecutionOwnership: { mode: "kernel" },
+			...input.initialStatus, state: "queued", kernelOperationDirectory: prepared.operationDirectory, effectiveExecutionOwnership: { mode: "kernel" },
 			processTerminal: { version: 1, state: "pending", runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId },
 		});
-		updateActiveRunIndex(input.asyncDir, input.initialStatus.state, input.initialStatus.toolCallId);
+		updateActiveRunIndex(input.asyncDir, "queued", input.initialStatus.toolCallId);
 		writeRunnerStartupControl(input.startupProceedPath, { action: "proceed", token: input.runnerProcessInstanceId });
+		const handle = await launchKernelOwnedProcess(input.request);
+		const pid = handle.workloadIdentity?.pid;
+		if (handle.observation.status === "never-started") return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: "Kernel admission was cancelled before workload launch.", startupDidNotProceed: true };
 		let observing = false;
 		const monitor = setInterval(() => {
 			if (observing) return;
@@ -722,7 +723,7 @@ async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunner
 			}).catch((cause) => console.error("Kernel runner observation failed:", cause)).finally(() => { observing = false; });
 		}, 1_000);
 		monitor.unref();
-		return { pid, runnerProcessInstanceId: input.runnerProcessInstanceId };
+		return { pid, kernelPending: !pid, runnerProcessInstanceId: input.runnerProcessInstanceId };
 	} catch (error) {
 		await cancelKernelOwnedProcess(input.request.operationDirectory, { deadlineMs: 1_000 }).catch(() => undefined);
 		return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: error instanceof Error ? error.message : String(error), startupDidNotProceed: true };
@@ -1690,11 +1691,11 @@ export function executeAsyncChain(
 		else params.activeAsyncCapacity?.markStarted(spawnResult.runnerProcessInstanceId);
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': ${spawnResult.error}`);
 	}
-	if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId) {
+	if ((!spawnResult.pid && !spawnResult.kernelPending) || !spawnResult.runnerProcessInstanceId) {
 		params.activeAsyncCapacity?.rollback();
 		return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': runner identity unavailable`);
 	}
-	if (spawnResult.pid) {
+	if (spawnResult.pid || spawnResult.kernelPending) {
 		const eventFirstStep = eventChain[0];
 		if (!eventFirstStep) {
 			return formatAsyncStartError(resultMode, `Failed to start async ${resultMode} '${id}': event chain has no steps`);
@@ -2311,11 +2312,11 @@ export function executeAsyncSingle(
 		else params.activeAsyncCapacity?.markStarted(spawnResult.runnerProcessInstanceId);
 		return formatAsyncStartError("single", `Failed to start async run '${id}': ${spawnResult.error}`);
 	}
-	if (!spawnResult.pid || !spawnResult.runnerProcessInstanceId) {
+	if ((!spawnResult.pid && !spawnResult.kernelPending) || !spawnResult.runnerProcessInstanceId) {
 		params.activeAsyncCapacity?.rollback();
 		return formatAsyncStartError("single", `Failed to start async run '${id}': runner identity unavailable`);
 	}
-	if (spawnResult.pid) {
+	if (spawnResult.pid || spawnResult.kernelPending) {
 		if (inheritedNestedRoute && nestedAddress) {
 			const now = Date.now();
 			try {

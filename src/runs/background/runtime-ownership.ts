@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import {
-	preflightKernelOwnedProcess, observeKernelOwnedProcess, cancelKernelOwnedProcess,
+	preflightKernelOwnedProcess, observeKernelOwnedProcess, reconcileKernelOwnedProcess, cancelKernelOwnedProcess,
 	type KernelOperationBinding, type KernelOwnedProcessCapability, type KernelOwnedProcessObservation,
 } from "../../api/kernel-owned-process.mjs";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
@@ -105,14 +105,23 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 	const mapping = readNativeKernelMapping(operationDirectory, runId);
 	let observation = await observeKernelOwnedProcess(operationDirectory);
 	const status = mapping ? readStatus(mapping.asyncDir) : null;
+	const bindingVerified = Boolean(mapping && observation.binding && sameBinding(mapping.kernelBinding, observation.binding));
 	let nativeStopRequested = false;
 	try {
 		const stop: unknown = JSON.parse(fs.readFileSync(path.join(operationDirectory, "native-stop.json"), "utf8"));
 		nativeStopRequested = nativeStopValidator.Check(stop) && stop.runId === runId;
 	} catch {}
+	const outerStopRequested = fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json"));
 	const runnerFailed = Boolean(observation.signal) || (observation.exitCode !== undefined && observation.exitCode !== null && observation.exitCode !== 0)
 		|| (observation.exitCode === 0 && (!status || status.state === "running" || status.state === "queued"));
-	if (mapping && (runnerFailed || nativeStopRequested || status?.stopped === true) && observation.status === "active") observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
+	if (bindingVerified && (runnerFailed || outerStopRequested || nativeStopRequested || status?.stopped === true) && (observation.status === "active" || observation.status === "pending")) observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
+	else if (mapping && bindingVerified && observation.exitCode === undefined && (observation.status === "pending" || observation.status === "active")) {
+		const permissionPath = path.join(mapping.asyncDir, "runner-startup-proceed.json");
+		if (!fs.existsSync(permissionPath) && !fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) && !fs.existsSync(path.join(operationDirectory, "native-stop.json"))) {
+			writePrivateAtomicJson(permissionPath, { action: "proceed", token: mapping.runnerProcessInstanceId });
+		}
+		if (observation.status === "pending" && !fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) && !fs.existsSync(path.join(operationDirectory, "native-stop.json"))) observation = await reconcileKernelOwnedProcess(operationDirectory);
+	}
 	let proof: NativeKernelTerminalProof = { version: 1, state: "unknown", runId, runnerProcessInstanceId: mapping?.runnerProcessInstanceId ?? "unknown", reason: "Kernel ownership mapping or retirement evidence is unavailable." };
 	const binding = mapping?.kernelBinding;
 	const kernelProof = observation.proof;
@@ -127,7 +136,7 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 				if (!validKernelTerminalProof(proof)) proof = { version: 1, state: "unknown", runId, runnerProcessInstanceId: mapping.runnerProcessInstanceId, reason: "Kernel retirement evidence has inconsistent identity bindings." };
 			}
 		}
-	} else if (mapping && (observation.status === "active" || observation.status === "pending")) {
+	} else if (mapping && bindingVerified && (observation.status === "active" || observation.status === "pending")) {
 		proof = { version: 1, state: "pending", runId, runnerProcessInstanceId: mapping.runnerProcessInstanceId, reason: "Owned runner or descendants remain active." };
 	}
 	if (proof.state === "observed" && mapping) {
@@ -144,5 +153,5 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 			});
 		}
 	}
-	return { mapping, observation, processTerminalProof: proof, neverStarted, runnerFailed };
+	return { mapping, observation, processTerminalProof: proof, neverStarted, runnerFailed, bindingVerified };
 }

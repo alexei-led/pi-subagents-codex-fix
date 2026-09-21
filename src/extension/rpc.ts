@@ -30,7 +30,7 @@ import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsync
 import { DurableOperation, operationRequestHash } from "../runs/background/durable-operation.ts";
 import { readProcessTerminal } from "../runs/background/process-terminal.ts";
 import { readWorkflowTerminalProof } from "../runs/background/workflow-terminal.ts";
-import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, probeRuntimeOwnership } from "../runs/background/runtime-ownership.ts";
+import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, readNativeKernelMapping, probeRuntimeOwnership } from "../runs/background/runtime-ownership.ts";
 import { cancelKernelOwnedProcess, type KernelOwnedProcessCapability } from "../api/kernel-owned-process.mjs";
 import { parseOwnedWorkflow, validateOwnedWorkflowPublicFields } from "../runs/shared/owned-workflow.ts";
 
@@ -754,6 +754,10 @@ async function observeOperation(operation: DurableOperation, options: RegisterSu
 	const kernel = intent.effectiveExecutionOwnership?.mode === "kernel" ? await observeNativeKernelRun(path.join(operation.directory, "owned"), intent.runId) : undefined;
 	const asyncDir = kernel?.mapping?.asyncDir ?? responseRecord.details?.asyncDir ?? path.join(options.asyncDirRoot ?? DIRS.async, intent.runId);
 	const status = readStatus(asyncDir);
+	if (responseRecord.isError && kernel?.bindingVerified && (kernel.observation.status === "pending" || kernel.observation.status === "active" || (kernel.observation.status === "retired" && status?.state === "complete"))) {
+		responseRecord.isError = false;
+		responseRecord.text = "The original owned execution is being reconciled.";
+	}
 	const resultPath = resolveAsyncRunLocation({ runId: intent.runId, dir: asyncDir }, options.asyncDirRoot ?? DIRS.async, options.resultsDir ?? DIRS.results).resultPath;
 	let processTerminalProof = kernel?.processTerminalProof ?? readProcessTerminal(asyncDir, { runId: intent.runId });
 	if (kernel?.processTerminalProof.state === "observed" && (kernel.mapping?.nativeOperation?.operationId !== intent.operationId || kernel.mapping.nativeOperation.digest !== intent.digest)) processTerminalProof = { version: 1, state: "unknown", runId: intent.runId, runnerProcessInstanceId: "unknown", reason: "Kernel mapping does not match the durable native operation." };
@@ -814,11 +818,17 @@ function stopOwnedRunTree(runId: string, asyncDir: string, sessionId: string | u
 async function stopOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext): Promise<void> {
 	const intent = operation.intent();
 	if (!intent || intent.kind === "cancel") return;
+	if (intent.effectiveExecutionOwnership?.mode === "kernel") {
+		const ownedDirectory = path.join(operation.directory, "owned");
+		const mapping = readNativeKernelMapping(ownedDirectory, intent.runId);
+		if (mapping) deliverStopRequest({ asyncDir: mapping.asyncDir, source: "owned-operation-cancel" });
+		await cancelKernelOwnedProcess(ownedDirectory, { deadlineMs: 1_000 });
+		return;
+	}
 	const observation = await observeOperation(operation, options);
 	if (!("asyncDir" in observation)) return;
 	// A persisted workflow can outlive its in-process controller after restart.
 	stopOwnedRunTree(intent.runId, observation.asyncDir, intent.sessionId, options, ctx, new Set());
-	if (intent.effectiveExecutionOwnership?.mode === "kernel") await cancelKernelOwnedProcess(path.join(operation.directory, "owned"), { deadlineMs: 1_000 });
 }
 
 async function handleOperation(

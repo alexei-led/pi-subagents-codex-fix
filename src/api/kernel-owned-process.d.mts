@@ -91,6 +91,9 @@ export function observeKernelOwnedProcess(
   operationDirectory: string,
 ): Promise<KernelOwnedProcessObservation>;
 
+/** Retry only the same authorized prepared admission; durable cancellation remains authoritative. */
+export function reconcileKernelOwnedProcess(operationDirectory: string): Promise<KernelOwnedProcessObservation>;
+
 /** Write a durable stop request. Safe within the operation; does not claim retirement. */
 export function requestKernelOwnedProcessCancellation(operationDirectory: string): Promise<void>;
 

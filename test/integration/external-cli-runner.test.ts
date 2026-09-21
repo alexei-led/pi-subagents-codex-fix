@@ -462,10 +462,14 @@ describe("external CLI async lifecycle", () => {
 		const script = `const fs=require('fs');const finish=${JSON.stringify(finish)};fs.writeFileSync(${JSON.stringify(startedMarker)},'');const hold=setInterval(()=>{if(fs.existsSync(finish)){clearInterval(hold);process.exit(0)}},10)`;
 		const { asyncDir, configPath } = writeExternalConfig(dir, "external-git-unchanged", script, attentionControl, gitDir);
 		const runnerDone = startRunner(configPath, path.resolve(import.meta.dirname, "../.."));
-		await waitForFile(startedMarker);
-		const attention = await waitForStatus(path.join(asyncDir, "status.json"), (status) => status.steps?.[0]?.activityState === "needs_attention", 7_000);
-		assert.equal(attention.activityState, "needs_attention");
-		fs.writeFileSync(finish, "");
+		try {
+			await waitForFile(startedMarker, 15_000);
+			const attention = await waitForStatus(path.join(asyncDir, "status.json"), (status) => status.steps?.[0]?.activityState === "needs_attention", 7_000);
+			assert.equal(attention.activityState, "needs_attention");
+		} finally {
+			fs.writeFileSync(finish, "");
+			await runnerDone;
+		}
 		assert.equal(await runnerDone, 0);
 	});
 

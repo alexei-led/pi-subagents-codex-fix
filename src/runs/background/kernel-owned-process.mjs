@@ -257,6 +257,51 @@ async function bootout(directory, envelope) {
   }
 }
 
+async function ensurePreparedBootstrap(directory, envelope) {
+  if (cancelled(directory)) { sealNeverStarted(directory, envelope); return; }
+  if (loadDecision(directory, envelope)) return;
+  publishJson(path.join(directory, "bootstrap.json"), { ...binding(envelope), requestedAt: new Date().toISOString() });
+  const intent = optionalJson(path.join(directory, "bootstrap.json"));
+  if (!bound(intent, envelope) || !isTimestamp(intent.requestedAt)) throw new Error("bootstrap-intent-invalid");
+  const target = `${envelope.request.domain}/${envelope.request.label}`;
+  let absent = false;
+  try {
+    await execute("/bin/launchctl", ["print", target], { timeout: serviceTimeout(1500), maxBuffer: 65536 });
+  } catch (error) {
+    absent = isString(error.stderr) && error.stderr.includes("Could not find service");
+  }
+  if (!absent || loadDecision(directory, envelope)) return;
+  if (cancelled(directory)) { sealNeverStarted(directory, envelope); return; }
+  const job = path.join(directory, "job.plist");
+  const content = plist(directory, envelope);
+  publish(job, content);
+  if (fs.readFileSync(job, "utf8") !== content) throw new Error("launch-plist-digest-mismatch");
+  try {
+    await execute("/bin/launchctl", ["bootstrap", envelope.request.domain, job], { timeout: serviceTimeout(), maxBuffer: 65536 });
+  } catch {
+    /* A bounded service timeout leaves the same prepared admission pending. */
+  }
+}
+
+/** Reconcile an already-authorized immutable request; never manufacture a new launch identity. */
+export async function reconcileKernelOwnedProcess(operationDirectory) {
+  const directory = path.resolve(operationDirectory);
+  const observation = await observeKernelOwnedProcess(directory);
+  if (observation.status !== "pending") return observation;
+  if (process.env[MARKER]) return { ...observation, status: "unknown", reason: "nested-owned-launch-unsupported" };
+  try {
+    await serviceDeadline.run(Date.now() + 1200, async () => {
+      const envelope = loadRequest(directory);
+      verifyAssets(directory, envelope);
+      await checkHost(envelope);
+      await ensurePreparedBootstrap(directory, envelope);
+    });
+  } catch {
+    return { ...observation, reason: "prepared-launch-reconciliation-pending" };
+  }
+  return observeKernelOwnedProcess(directory);
+}
+
 export async function launchKernelOwnedProcess(input) {
   const prepared = await prepareKernelOwnedProcess(input);
   const directory = prepared.operationDirectory;
@@ -270,39 +315,7 @@ export async function launchKernelOwnedProcess(input) {
       workloadIdentity: observation.workloadIdentity,
     };
   if (observation.status === "unknown") throw new Error("owned-launch-journal-unknown");
-  if (observation.status === "pending") {
-    publishJson(path.join(directory, "bootstrap.json"), {
-      ...binding(envelope),
-      requestedAt: new Date().toISOString(),
-    });
-    const intent = optionalJson(path.join(directory, "bootstrap.json"));
-    if (!bound(intent, envelope) || !isTimestamp(intent.requestedAt))
-      throw new Error("bootstrap-intent-invalid");
-    {
-      const target = `${envelope.request.domain}/${envelope.request.label}`;
-      let absent = false;
-      try {
-        await execute("/bin/launchctl", ["print", target], { timeout: 1500, maxBuffer: 65536 });
-      } catch (error) {
-        absent = isString(error.stderr) && error.stderr.includes("Could not find service");
-      }
-      if (absent) {
-        const job = path.join(directory, "job.plist");
-        const content = plist(directory, envelope);
-        publish(job, content);
-        if (fs.readFileSync(job, "utf8") !== content)
-          throw new Error("launch-plist-digest-mismatch");
-        try {
-          await execute("/bin/launchctl", ["bootstrap", envelope.request.domain, job], {
-            timeout: 2000,
-            maxBuffer: 65536,
-          });
-        } catch {
-          /* A delayed service call remains pending until admission or a durable cancellation. */
-        }
-      }
-    }
-  }
+  if (observation.status === "pending") await ensurePreparedBootstrap(directory, envelope);
   const deadline = Date.now() + 5000;
   do {
     observation = await observeKernelOwnedProcess(directory);

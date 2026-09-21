@@ -22,7 +22,7 @@ import { createCapacityResilientJsonWriter } from "../../shared/capacity-resilie
 import { isStorageCapacityError } from "../../shared/file-system-retry.ts";
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { createChildTranscriptWriter, type ChildTranscriptWriter } from "../../shared/child-transcript.ts";
-import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, consumeStopRequestPayloads, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, watchAsyncControlInbox, type SteerRequest, type StopRequest } from "./control-channel.ts";
+import { closeSteerInbox, consumeInterruptRequest, consumeSteerRequests, consumeStopRequestPayloads, deliverInterruptRequest, deliverStopRequest, deliverTimeoutRequest, watchAsyncControlInbox, stopRequestPath, stopRequestsDir, type SteerRequest, type StopRequest } from "./control-channel.ts";
 import { appendJsonl as appendRawJsonl, formatOutputArtifactContent, getArtifactPaths, writeArtifact, writeMetadata } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { preflightLaunchCwd } from "../shared/launch-cwd.ts";
@@ -5157,14 +5157,32 @@ export async function runSubagent(
 	}
 }
 
-async function waitForStartupControl(
+const startupStopValidator = Compile(Type.Object({ type: Type.Literal("stop"), targetIndex: Type.Optional(Type.Integer()), childId: Type.Optional(Type.String()) }));
+
+function startupStopRequested(asyncDir: string): boolean {
+	const candidates = [stopRequestPath(asyncDir)];
+	try { candidates.push(...fs.readdirSync(stopRequestsDir(asyncDir)).filter((name) => name.endsWith(".json")).map((name) => path.join(stopRequestsDir(asyncDir), name))); } catch {}
+	for (const file of candidates) {
+		try {
+			const value: unknown = JSON.parse(fs.readFileSync(file, "utf8"));
+			if (startupStopValidator.Check(value) && value.targetIndex === undefined && value.childId === undefined) return true;
+		} catch {}
+	}
+	return false;
+}
+
+export async function waitForStartupControl(
 	controlPath: string,
 	token: string,
 	action: "ack" | "confirm" | "proceed",
-	timeoutMs = 30_000,
+	executionLifetime?: ExecutionLifetime,
 ): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (Date.now() <= deadline) {
+	const resolved = resolveExecutionLifetime(executionLifetime, 30_000);
+	if (resolved.error) throw new Error(resolved.error);
+	const timeoutMs = resolved.timeoutMs;
+	const deadline = timeoutMs === undefined ? undefined : Date.now() + timeoutMs;
+	while (deadline === undefined || Date.now() <= deadline) {
+		if (startupStopRequested(path.dirname(controlPath))) throw new Error("Runner startup was cancelled before permission was granted.");
 		if (fs.existsSync(controlPath)) {
 			let payload: { action?: unknown; token?: unknown };
 			try {
@@ -5199,7 +5217,7 @@ export async function runConfiguredSubagent(config: SubagentRunConfig, options?:
 	process.once("exit", releaseOnExit);
 	try {
 		if (config.launchBarrierToken) {
-			await waitForStartupControl(startupProceedPath, config.launchBarrierToken, "proceed");
+			await waitForStartupControl(startupProceedPath, config.launchBarrierToken, "proceed", config.executionLifetime);
 			startupCommitted = true;
 			try {
 				fs.rmSync(startupProceedPath, { force: true });
@@ -5210,11 +5228,11 @@ export async function runConfiguredSubagent(config: SubagentRunConfig, options?:
 			lease = acquireSessionLease(config.revivalLease);
 			config.revivalLeaseToken = lease.owner.token;
 			writeAtomicJson(startupPath, { state: "ready", token: lease.owner.token, pid: process.pid, owner: lease.owner });
-			await waitForStartupControl(startupAckPath, lease.owner.token, "ack");
+			await waitForStartupControl(startupAckPath, lease.owner.token, "ack", config.executionLifetime);
 			writeAtomicJson(startupPath, { state: "acknowledged", token: lease.owner.token, pid: process.pid });
-			await waitForStartupControl(startupConfirmPath, lease.owner.token, "confirm");
+			await waitForStartupControl(startupConfirmPath, lease.owner.token, "confirm", config.executionLifetime);
 			writeAtomicJson(startupPath, { state: "confirmed", token: lease.owner.token, pid: process.pid });
-			await waitForStartupControl(startupProceedPath, lease.owner.token, "proceed");
+			await waitForStartupControl(startupProceedPath, lease.owner.token, "proceed", config.executionLifetime);
 			startupCommitted = true;
 			for (const controlPath of [startupAckPath, startupConfirmPath, startupProceedPath]) {
 				try {

@@ -9,6 +9,7 @@ import {
   cancelKernelOwnedProcess,
   launchKernelOwnedProcess,
   observeKernelOwnedProcess,
+  reconcileKernelOwnedProcess,
   prepareKernelOwnedProcess,
   requestKernelOwnedProcessCancellation,
   type KernelOwnedProcessRequest,
@@ -113,7 +114,18 @@ test(
         assert.equal(observation.status, "never-started");
         assert.equal(observation.proof?.requestDigest, prepared.requestDigest);
         assert.equal(replay.observation.status, "never-started");
+        assert.equal((await reconcileKernelOwnedProcess(input.operationDirectory)).status, "never-started");
         assert.equal(fs.existsSync(path.join(suite, "cancel-first.result")), false);
+      });
+      await context.test("a recovered controller reconciles one prepared launch without a new identity", async () => {
+        const input = request("prepared-reconcile", "counter");
+        const prepared = await prepareKernelOwnedProcess(input);
+        assert.equal((await observeKernelOwnedProcess(input.operationDirectory)).status, "pending");
+        await Promise.all([reconcileKernelOwnedProcess(input.operationDirectory), reconcileKernelOwnedProcess(input.operationDirectory)]);
+        const retired = await retire(input.operationDirectory);
+        assert.equal(retired.proof?.requestDigest, prepared.requestDigest);
+        assert.equal((await reconcileKernelOwnedProcess(input.operationDirectory)).status, "retired");
+        assert.equal(fs.readFileSync(path.join(suite, "prepared-reconcile.result"), "utf8"), "executed\n");
       });
       await context.test("cancellation races admission without duplicate execution", async () => {
         const input = request("cancel-race", "counter");

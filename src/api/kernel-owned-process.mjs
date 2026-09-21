@@ -3,6 +3,7 @@ export {
   prepareKernelOwnedProcess,
   launchKernelOwnedProcess,
   observeKernelOwnedProcess,
+  reconcileKernelOwnedProcess,
   requestKernelOwnedProcessCancellation,
   cancelKernelOwnedProcess,
   inspectKernelOwnedProcessMembership,

@@ -180,6 +180,7 @@ test("published extension APIs use supported package entrypoints", async () => {
 	const kernel = await import("pi-subagents/kernel-owned-process");
 	assert.equal(typeof kernel.prepareKernelOwnedProcess, "function");
 	assert.equal(typeof kernel.launchKernelOwnedProcess, "function");
+	assert.equal(typeof kernel.reconcileKernelOwnedProcess, "function");
 	assert.equal(typeof kernel.inspectKernelOwnedProcessMembership, "function");
 });
 

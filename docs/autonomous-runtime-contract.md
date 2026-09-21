@@ -66,6 +66,19 @@ the persistent operation directory. An unresolved launch intent remains pending
 when no runner evidence exists. A control timeout, missing
 status file, or stale session never permits a second dispatch for that identity.
 
+Admission may remain pending after the bounded startup acknowledgement wait.
+Lookup reconciles the same prepared operation and startup permission while its
+durable cancellation fence remains absent. Explicit unbounded runners have no
+startup-permission deadline. A delayed admission does not become a failed task
+merely because the service acknowledgement expired.
+
+Direct consumers of `pi-subagents/kernel-owned-process` can call
+`reconcileKernelOwnedProcess(operationDirectory): Promise<KernelOwnedProcessObservation>`
+to retry admission for an already authorized immutable request. They must check
+their own stop/pause fences first. Reconciliation preserves the prepared identity
+and honors the kernel cancellation marker; `observeKernelOwnedProcess` alone
+does not initiate admission.
+
 ## Cancellation and exit evidence
 
 `cancel({ operationId, digest })` persists a fence before requesting cancellation.
