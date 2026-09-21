@@ -97,3 +97,27 @@ test("owned process tree does not claim observed while a detached descendant rem
 		}
 	}
 });
+
+test("process-group evidence explicitly leaves escaped reparented descendants unverified", { skip: process.platform === "win32" }, async () => {
+	const writer = spawn(process.execPath, ["-e", `
+		const { spawn } = require("node:child_process");
+		const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+		process.stdout.write(String(child.pid) + "\\n");
+		child.unref();
+	`], { detached: true, stdio: ["ignore", "pipe", "ignore"] });
+	assert.ok(writer.pid);
+	const closed = new Promise<void>((resolve) => writer.once("close", () => resolve()));
+	const escapedPid = await new Promise<number>((resolve, reject) => {
+		writer.once("error", reject);
+		writer.stdout!.once("data", (chunk) => resolve(Number(String(chunk).trim())));
+	});
+	try {
+		await closed;
+		const proof = await createOwnedProcessTreeController(writer.pid, { termGraceMs: 50, killVerifyMs: 1000 }).finishAfterWriterClose();
+		assert.equal(proof.state, "observed");
+		assert.equal(processIsActive(escapedPid), true);
+		if (proof.state === "observed" && proof.mechanism === "posix-process-group") assert.equal(proof.containment, "unverified");
+	} finally {
+		try { process.kill(-escapedPid, "SIGKILL"); } catch {}
+	}
+});

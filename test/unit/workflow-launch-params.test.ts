@@ -488,3 +488,10 @@ describe("workflow launch params", () => {
 		});
 	});
 });
+
+it("awaits explicit background children when the workflow owns detached completion", () => {
+	const params = prepareWorkflowLaunchParams({ executionLifetime: { mode: "unbounded" } }, { agent: "worker", task: "Run", async: true }, "workflow", "child", { awaitDetachedChild: true });
+	assert.equal(params.async, true);
+	assert.equal(params.workflowAwaitAsync, true);
+	assert.equal(params.workflowAwaitDetached, true);
+});

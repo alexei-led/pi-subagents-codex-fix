@@ -70,7 +70,7 @@ async function waitUntilGroupTerminal(
 }
 
 function observed(processGroupId: number): ProcessTreeTerminal {
-	return { state: "observed", mechanism: "posix-process-group", processGroupId, verifiedAt: Date.now() };
+	return { state: "observed", mechanism: "posix-process-group", containment: "unverified", processGroupId, verifiedAt: Date.now() };
 }
 
 function observedUnlessLiveDetached(processGroupId: number, detached: readonly number[]): ProcessTreeTerminal {

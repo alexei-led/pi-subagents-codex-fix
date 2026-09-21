@@ -58,6 +58,7 @@ export interface ChildSupervisorMetadata {
  * that hosts the child session builds it and passes it to the hooks directly.
  */
 export interface ChildRuntimeConfig {
+	executionLifetime?: import("../../shared/types.ts").ExecutionLifetime;
 	cwd?: string;
 	runId?: string;
 	agent?: string;

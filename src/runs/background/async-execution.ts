@@ -1,3 +1,5 @@
+import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
+import type { ExecutionLifetime } from "../../shared/types.ts";
 /**
  * Async execution logic for subagent tool
  */
@@ -227,6 +229,7 @@ interface AsyncChainParams {
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
 	fast?: boolean;
+	executionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	toolBudget?: ResolvedToolBudget;
 	usageBudget?: UsageBudgetConfig;
@@ -302,6 +305,7 @@ interface AsyncSingleParams {
 	childIntercomTarget?: (agent: string, index: number) => string | undefined;
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
+	executionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	absoluteDeadlineAt?: number;
 	/** Optional per-call hard toolTimeoutMs override (highest precedence). */
@@ -341,6 +345,7 @@ interface AsyncExecutionResult {
 }
 
 export interface AsyncRunnerStepBuildParams {
+	executionLifetime?: ExecutionLifetime;
 	chain: ChainStep[];
 	task?: string;
 	attachRoot?: ImportedAsyncRoot & { agent: string; outputName?: string; label?: string };
@@ -1197,7 +1202,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
-			timeoutMs: a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS,
+			timeoutMs: resolveExecutionLifetime(params.executionLifetime, a.defaultTimeoutMs ?? DEFAULT_ASYNC_TIMEOUT_MS).timeoutMs,
+			executionLifetime: params.executionLifetime,
 			toolTimeoutMs: resolvedToolTimeout.toolTimeoutMs,
 			waitToolEnabled: params.waitToolEnabled,
 			waitToolDefaultTimeoutMs: params.waitToolDefaultTimeoutMs,
@@ -1415,6 +1421,7 @@ export function executeAsyncChain(
 	}
 
 	const built = buildAsyncRunnerSteps(id, {
+		executionLifetime: params.executionLifetime,
 		chain,
 		task: params.task,
 		attachRoot: params.attachRoot,
@@ -1459,7 +1466,10 @@ export function executeAsyncChain(
 		return formatAsyncStartError(resultMode, built.error);
 	}
 	const { steps, runnerCwd, workflowGraph, eventChain } = built;
-	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
+	const lifetime = resolveExecutionLifetime(params.executionLifetime, params.timeoutMs);
+	if (lifetime.error) return formatAsyncStartError(resultMode, lifetime.error);
+	const effectiveExecutionLifetime = lifetime.effectiveExecutionLifetime!;
+	const deadlineAt = lifetime.timeoutMs !== undefined ? Date.now() + lifetime.timeoutMs : undefined;
 	const initialUsageBudget = usageBudgetState(params.usageBudget, undefined);
 	let childTargetIndex = 0;
 	const childIntercomTargets = childIntercomTarget ? steps.flatMap((step) => {
@@ -1527,7 +1537,9 @@ export function executeAsyncChain(
 				childIntercomTargets,
 				resultMode,
 				dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
-				timeoutMs: params.timeoutMs,
+				timeoutMs: lifetime.timeoutMs,
+				executionLifetime: params.executionLifetime,
+				effectiveExecutionLifetime,
 				deadlineAt,
 				globalConcurrencyLimit: params.globalConcurrencyLimit,
 				runFanoutBudget,
@@ -1641,7 +1653,7 @@ export function executeAsyncChain(
 						agents: flatAgents,
 						chainStepCount: eventChain.length,
 						parallelGroups,
-						...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
+						effectiveExecutionLifetime, ...(lifetime.timeoutMs !== undefined ? { timeoutMs: lifetime.timeoutMs, deadlineAt } : {}),
 						startedAt: now,
 						lastUpdate: now,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -1671,7 +1683,7 @@ export function executeAsyncChain(
 			cwd: runnerCwd,
 			asyncDir,
 			...(sessionRoot ? { sessionRoot } : {}),
-			...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
+			effectiveExecutionLifetime, ...(lifetime.timeoutMs !== undefined ? { timeoutMs: lifetime.timeoutMs, deadlineAt } : {}),
 			...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}),
 			...(capabilityCeiling ? { capabilityCeiling } : {}),
 			...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
@@ -1688,7 +1700,7 @@ export function executeAsyncChain(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`, ctx.interactive === true) }],
-		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
+		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}), ...(params.workflowKey ? { workflowKey: params.workflowKey } : {}), effectiveExecutionLifetime, ...(lifetime.timeoutMs !== undefined ? { timeoutMs: lifetime.timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) },
 	};
 }
 
@@ -1888,10 +1900,13 @@ export function executeAsyncSingle(
 	const toolBudgetInput = params.toolBudget ?? agentConfig.toolBudget ?? params.configToolBudget;
 	const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, params.toolBudget ? "toolBudget" : agentConfig.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 	if (resolvedToolBudget.error) return formatAsyncStartError("single", resolvedToolBudget.error);
-	const deadlineAt = params.absoluteDeadlineAt ?? (params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined);
+	const lifetime = resolveExecutionLifetime(params.executionLifetime, params.timeoutMs);
+	if (lifetime.error) return formatAsyncStartError("single", lifetime.error);
+	const effectiveExecutionLifetime = lifetime.effectiveExecutionLifetime!;
+	const deadlineAt = params.executionLifetime?.mode === "unbounded" ? undefined : params.absoluteDeadlineAt ?? (lifetime.timeoutMs !== undefined ? Date.now() + lifetime.timeoutMs : undefined);
 	const timeoutMs = params.absoluteDeadlineAt !== undefined && deadlineAt !== undefined
 		? deadlineAt - Date.now()
-		: params.timeoutMs;
+		: lifetime.timeoutMs;
 	if (timeoutMs !== undefined && timeoutMs <= 0) return formatAsyncStartError("single", "The source run's absolute deadline expired before recovery could launch.");
 	const resolvedToolTimeout = resolveToolTimeoutMs({
 		callValue: params.toolTimeoutMs,
@@ -1970,6 +1985,8 @@ export function executeAsyncSingle(
 	});
 	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
 	const recoveryDescriptor: SteeringRecoveryDescriptor = {
+		executionLifetime: params.executionLifetime,
+		effectiveExecutionLifetime,
 		...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),
 		version: 1,
 		...(lane ? { lane } : {}),
@@ -2043,6 +2060,7 @@ export function executeAsyncSingle(
 				steps: [
 					{
 						parentSessionId: launchParentSessionId,
+						executionLifetime: params.executionLifetime,
 						permissionRules,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
 						agent,
@@ -2126,6 +2144,8 @@ export function executeAsyncSingle(
 				worktreeBranchPrefix,
 				controlConfig,
 				timeoutMs,
+				executionLifetime: params.executionLifetime,
+				effectiveExecutionLifetime,
 				deadlineAt,
 				toolTimeoutMs,
 				checkpointBeforeDeadlineMs: params.checkpointBeforeDeadlineMs,
@@ -2215,7 +2235,7 @@ export function executeAsyncSingle(
 						agent,
 						agents: [agent],
 						chainStepCount: 1,
-						...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
+						effectiveExecutionLifetime, ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
 						startedAt: now,
 						lastUpdate: now,
 						...(capabilityCeiling ? { capabilityCeiling } : {}),
@@ -2242,7 +2262,7 @@ export function executeAsyncSingle(
 			launchResolvedExtensions,
 			...(params.parentWorkflowRunId ? { parentWorkflowRunId: params.parentWorkflowRunId } : {}),
 			...(params.workflowKey ? { workflowKey: params.workflowKey } : {}),
-			...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
+			effectiveExecutionLifetime, ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
 			...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}),
 			...(capabilityCeiling ? { capabilityCeiling } : {}),
 			nestedRoute,
@@ -2251,7 +2271,7 @@ export function executeAsyncSingle(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`, ctx.interactive === true) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
+		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), effectiveExecutionLifetime, ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
 	};
 	};
 	return spawnResultOrPromise instanceof Promise ? spawnResultOrPromise.then(finishSpawnResult) : finishSpawnResult(spawnResultOrPromise);

@@ -426,6 +426,7 @@ async function runSingleAttempt(
 		maxSubagentDepth: options.maxSubagentDepth,
 		runtimeSnapshotHost: options.runtimeSnapshotHost,
 		inherited: options.childRuntime,
+		executionLifetime: options.executionLifetime,
 		host: "parent",
 	});
 	if (!options.machine && options.parentProviderRegistry) launch.session.parentProviderRegistry = options.parentProviderRegistry;

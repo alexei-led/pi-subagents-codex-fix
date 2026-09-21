@@ -2,6 +2,7 @@ import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Compile } from "typebox/compile";
+import { Type } from "typebox";
 import { resolveAsyncRunLocation } from "../runs/background/async-resume.ts";
 import { deliverStopRequest } from "../runs/background/control-channel.ts";
 import { reconcileAsyncRun } from "../runs/background/stale-run-reconciler.ts";
@@ -25,13 +26,16 @@ import { SubagentParams } from "./schemas.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
 import { ASYNC_STATUS_SNAPSHOT_KIND, ASYNC_STATUS_SNAPSHOT_VERSION, buildAsyncStatusSnapshotForState } from "../runs/background/async-status-snapshot.ts";
 import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../runs/shared/child-identity.ts";
+import { DurableOperation, operationRequestHash } from "../runs/background/durable-operation.ts";
+import { readProcessTerminal } from "../runs/background/process-terminal.ts";
+import { readWorkflowTerminalProof } from "../runs/background/workflow-terminal.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 export const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
 export const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 
-export const SUBAGENT_RPC_METHODS = ["ping", "status", "manage", "spawn", "steer", "interrupt", "stop", "resume"] as const;
+export const SUBAGENT_RPC_METHODS = ["ping", "status", "manage", "spawn", "lookup", "cancel", "steer", "interrupt", "stop", "resume"] as const;
 export type SubagentRpcMethod = typeof SUBAGENT_RPC_METHODS[number];
 
 export interface SubagentRpcRequestEnvelope {
@@ -312,6 +316,7 @@ interface RegisterSubagentRpcBridgeOptions {
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
 	asyncDirRoot?: string;
+	operationDirRoot?: string;
 	resultsDir?: string;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 	now?: () => number;
@@ -442,6 +447,8 @@ function pingData(ctx: ExtensionContext | null) {
 		version: SUBAGENT_RPC_PROTOCOL_VERSION,
 		methods: [...SUBAGENT_RPC_METHODS],
 		capabilities: {
+			executionLifetime: { version: 1, modes: ["unbounded", "bounded"] },
+			durableOperations: { version: 1, lookup: true, replay: true, cancelFence: true, scope: "repository" },
 			status: true,
 			statusProjection: { version: 1, untargeted: "in-memory-when-ready", targeted: "executor" },
 			managementActions: [...SUBAGENT_RPC_MANAGEMENT_ACTIONS],
@@ -456,6 +463,8 @@ function pingData(ctx: ExtensionContext | null) {
 			launchResolvedExtensions: { version: 1, source: "launch-resolved" },
 			runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", event: "subagent:acknowledge-extension" },
 			processTerminalProof: { version: 1, lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION },
+			workflowTerminalProof: { version: 1 },
+			processTreeOwnership: { version: 1, scope: process.platform === "win32" ? "unsupported" : "posix-process-group", escapedDescendants: "unverified" },
 		},
 		events: {
 			ready: SUBAGENT_RPC_READY_EVENT,
@@ -513,6 +522,7 @@ function manageParams(params: unknown): SubagentParamsLike {
 
 function spawnParams(params: unknown): SubagentParamsLike {
 	const input = assertRecordParams(params, "spawn");
+	if (input.rpcOperationRunId !== undefined) throw new SubagentRpcError("invalid_params", "rpcOperationRunId is an internal field.");
 	const normalized = normalizePublicSubagentExecution(input);
 	if (!normalized.ok) throw new SubagentRpcError("invalid_params", normalized.error);
 	if (normalized.params.action !== undefined) {
@@ -562,6 +572,7 @@ function stopAsyncRun(
 	params: unknown,
 	options: RegisterSubagentRpcBridgeOptions,
 	ctx: ExtensionContext,
+	operationSessionId?: string,
 ): { runId: string; asyncDir: string; previousState: string; state: "stopping"; message: string; childId?: string } {
 	const input = assertRecordParams(params, "stop");
 	const rawChildId = input.childId;
@@ -583,7 +594,7 @@ function stopAsyncRun(
 		throw new SubagentRpcError("not_found", "Async run not found or already completed; stop requires a live async run directory.");
 	}
 
-	const currentSessionId = resolveCurrentSessionId(ctx.sessionManager);
+	const currentSessionId = operationSessionId ?? resolveCurrentSessionId(ctx.sessionManager);
 	const initialStatus = readStatus(location.asyncDir);
 	const initialRunId = initialStatus?.runId ?? location.resolvedId ?? path.basename(location.asyncDir);
 	if (!initialStatus) throw new SubagentRpcError("not_found", `Status file not found for async run '${initialRunId}'.`);
@@ -700,14 +711,137 @@ function stopAsyncRun(
 	};
 }
 
+const operationIdentityValidator = Compile(Type.Object({ operationId: Type.String({ minLength: 1, maxLength: 512, pattern: "^[^\\r\\n]+$" }), digest: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })) }));
+const operationResponseValidator = Compile(Type.Object({ text: Type.Optional(Type.String()), details: Type.Optional(Type.Object({ asyncDir: Type.Optional(Type.String()) })), isError: Type.Optional(Type.Boolean()) }));
+
+function operationInput(params: SubagentRpcRequestEnvelope["params"], method: SubagentRpcMethod) {
+	const input = assertRecordParams(params, method);
+	if (!operationIdentityValidator.Check(input) || !input.operationId.trim() || (method !== "lookup" && !input.digest?.trim()) || input.digest?.trim() === "") throw new SubagentRpcError("invalid_params", "operationId and digest must be non-empty strings of at most 512 characters without identity newlines.");
+	return { operationId: input.operationId, digest: input.digest, input };
+}
+
+function observeOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions) {
+	const intent = operation.intent();
+	if (!intent) return { operationId: operation.operationId, state: "absent", safeToReplay: true };
+	const response = operation.result();
+	const responseRecord = operationResponseValidator.Check(response) ? response : {};
+	const asyncDir = responseRecord.details?.asyncDir ?? path.join(options.asyncDirRoot ?? DIRS.async, intent.runId);
+	const status = readStatus(asyncDir);
+	const resultPath = resolveAsyncRunLocation({ runId: intent.runId, dir: asyncDir }, options.asyncDirRoot ?? DIRS.async, options.resultsDir ?? DIRS.results).resultPath;
+	const processTerminalProof = readProcessTerminal(asyncDir, { runId: intent.runId });
+	const workflowTerminalProof = status?.mode === "workflow" ? readWorkflowTerminalProof(asyncDir, intent.runId) : undefined;
+	const cancellationRequested = operation.cancelled();
+	return {
+		...responseRecord,
+		operationId: intent.operationId,
+		digest: intent.digest,
+		runId: intent.runId,
+		asyncDir,
+		resultPath,
+		state: cancellationRequested ? "cancelled" : response || status ? "found" : "pending",
+		safeToReplay: true,
+		cancellationRequested,
+		neverStarted: intent.kind === "cancel",
+		effectiveExecutionLifetime: intent.effectiveExecutionLifetime,
+		processTerminalProof,
+		workflowTerminalProof,
+		status: status?.state,
+		statusPayload: status ? { ...status, processTerminalProof, workflowTerminalProof, effectiveExecutionLifetime: intent.effectiveExecutionLifetime } : undefined,
+		activity: status ? {
+				state: status.activityState ?? "unknown",
+				phase: processTerminalProof?.state === "observed" || workflowTerminalProof?.state === "observed" ? "exited" : status.runnerPhase ?? "unknown",
+				lastActivityAt: status.lastActivityAt,
+				lastModelActivityAt: status.lastModelActivityAt,
+				lastToolActivityAt: status.lastToolActivityAt,
+				currentTool: status.currentTool,
+				currentToolStartedAt: status.currentToolStartedAt,
+				runnerPid: status.pid,
+				steps: status.steps?.map((step) => ({ agent: step.agent, activityState: step.activityState, phase: step.processTerminal?.state === "observed" ? "exited" : step.runnerPhase ?? "unknown", currentTool: step.currentTool, currentToolStartedAt: step.currentToolStartedAt, lastActivityAt: step.lastActivityAt, lastModelActivityAt: step.lastModelActivityAt, lastToolActivityAt: step.lastToolActivityAt, processTerminal: step.processTerminal })),
+			} : undefined,
+	};
+}
+
+function stopOwnedRunTree(runId: string, asyncDir: string, sessionId: string | undefined, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext, visited: Set<string>): void {
+	if (visited.has(runId)) return;
+	visited.add(runId);
+	try {
+		stopAsyncRun({ runId, dir: asyncDir }, options, ctx, sessionId);
+	} catch (error) {
+		if (!(error instanceof SubagentRpcError) || !["not_found", "invalid_state"].includes(error.code)) throw error;
+	}
+	const status = readStatus(asyncDir);
+	if (status?.runId !== runId || status.sessionId !== sessionId || status.mode !== "workflow") return;
+	for (const child of status.steps ?? []) {
+		if (!child.async || !child.runId || path.basename(child.runId) !== child.runId) continue;
+		stopOwnedRunTree(child.runId, path.join(path.dirname(asyncDir), child.runId), sessionId, options, ctx, visited);
+	}
+}
+
+function stopOperation(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions, ctx: ExtensionContext): void {
+	const intent = operation.intent();
+	if (!intent || intent.kind === "cancel") return;
+	const observation = observeOperation(operation, options);
+	if (!("asyncDir" in observation)) return;
+	// A persisted workflow can outlive its in-process controller after restart.
+	stopOwnedRunTree(intent.runId, observation.asyncDir, intent.sessionId, options, ctx, new Set());
+}
+
+async function handleOperation(
+	request: SubagentRpcRequestEnvelope,
+	options: RegisterSubagentRpcBridgeOptions,
+	ctx: ExtensionContext,
+	activeOperations: Map<string, AbortController>,
+): Promise<ReturnType<typeof observeOperation>> {
+	const { operationId, digest, input } = operationInput(request.params, request.method);
+	const operation = new DurableOperation(options.operationDirRoot ?? options.asyncDirRoot ?? path.join(ctx.cwd, ".pi", "subagent-runtime"), ctx.cwd, operationId);
+	const intent = operation.intent();
+	if (intent && digest !== undefined && intent.digest !== digest) throw new SubagentRpcError("invalid_params", "Operation digest does not match its durable intent.");
+	if (request.method === "lookup") {
+		if (operation.cancelled()) stopOperation(operation, options, ctx);
+		return observeOperation(operation, options);
+	}
+	if (request.method === "cancel") {
+		operation.cancel(digest!);
+		activeOperations.get(operation.directory)?.abort(new Error("Operation cancelled."));
+		stopOperation(operation, options, ctx);
+		return observeOperation(operation, options);
+	}
+	const { operationId: _operationId, digest: _digest, ...launchInput } = input;
+	const params = spawnParams(launchInput);
+	assertSubagentParams(params, "RPC spawn params");
+	const requestHash = operationRequestHash(params);
+	if (intent?.requestHash !== undefined && intent.requestHash !== requestHash) throw new SubagentRpcError("invalid_params", "Operation replay launch parameters do not match the original request.");
+	const claim: Parameters<DurableOperation["claim"]>[0] = { digest: digest!, requestHash, sessionId: resolveCurrentSessionId(ctx.sessionManager) };
+	if (params.executionLifetime !== undefined) claim.effectiveExecutionLifetime = params.executionLifetime;
+	const claimed = operation.claim(claim);
+	if (!claimed) {
+		const winner = operation.intent();
+		if (!winner || winner.digest !== digest || (winner.requestHash !== undefined && winner.requestHash !== requestHash)) throw new SubagentRpcError("invalid_params", "Concurrent operation launch does not match its durable intent.");
+		return observeOperation(operation, options);
+	}
+	if (operation.cancelled()) return observeOperation(operation, options);
+	const controller = new AbortController();
+	activeOperations.set(operation.directory, controller);
+	try {
+		const result = await options.execute(`rpc-spawn-${request.requestId}`, { ...params, rpcOperationRunId: operation.runId }, controller.signal, undefined, ctx);
+		operation.complete(dataFromToolResult(result));
+		if (operation.cancelled()) stopOperation(operation, options, ctx);
+		return observeOperation(operation, options);
+	} finally {
+		activeOperations.delete(operation.directory);
+	}
+}
+
 async function handleRequest(
 	request: SubagentRpcRequestEnvelope,
 	options: RegisterSubagentRpcBridgeOptions,
 	fleetKeys: FleetKeyState,
+	activeOperations: Map<string, AbortController>,
 ): Promise<unknown> {
 	const ctx = options.getContext();
 	if (request.method === "ping") return pingData(ctx);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
+	if (request.method === "lookup" || request.method === "cancel" || (request.method === "spawn" && isRecord(request.params) && (request.params.operationId !== undefined || request.params.digest !== undefined))) return handleOperation(request, options, ctx, activeOperations);
 
 	if (request.method === "manage") {
 		return executeChecked(options, ctx, request.requestId, request.method, manageParams(request.params));
@@ -819,11 +953,12 @@ export function registerSubagentRpcBridge(options: RegisterSubagentRpcBridgeOpti
 	dispose: () => void;
 } {
 	const fleetKeys: FleetKeyState = { sessionId: null, next: 0, keys: new Map() };
+	const activeOperations = new Map<string, AbortController>();
 	const unsubscribe = options.events.on(SUBAGENT_RPC_REQUEST_EVENT, async (raw) => {
 		let request: SubagentRpcRequestEnvelope | undefined;
 		try {
 			request = parseRequest(raw);
-			const data = await handleRequest(request, options, fleetKeys);
+			const data = await handleRequest(request, options, fleetKeys, activeOperations);
 			options.events.emit(subagentRpcReplyEvent(request.requestId), {
 				version: SUBAGENT_RPC_PROTOCOL_VERSION,
 				requestId: request.requestId,

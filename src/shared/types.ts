@@ -650,6 +650,8 @@ export type ProcessTreeTerminal =
 	| {
 		state: "observed";
 		mechanism: "posix-process-group";
+		/** Group enumeration cannot prove absence of already escaped descendants. */
+		containment?: "unverified";
 		processGroupId: number;
 		verifiedAt: number;
 	}
@@ -799,6 +801,8 @@ export interface RunFanoutRejection extends RunFanoutBudgetSnapshot {
 }
 
 export interface SteeringRecoveryDescriptor {
+	executionLifetime?: ExecutionLifetime;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	/** Captured response identity authority; absence means no declared aliases on revival. */
 	modelResponseAliases?: Record<string, string[]>;
 	version: 1;
@@ -942,6 +946,10 @@ export interface AgentProgress {
 	sessionName?: string;
 	status: "pending" | "running" | "completed" | "failed" | "detached";
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	task: string;
 	skills?: string[];
 	lastActivityAt?: number;
@@ -979,6 +987,10 @@ interface ProgressSummary {
 	sessionName?: string;
 	status?: AgentProgress["status"];
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	skills?: string[];
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -1400,6 +1412,10 @@ export interface AgentCapabilityRow {
 	extensions?: { names?: string[]; subagentOnly?: string[]; skills?: string[] };
 }
 
+export type RunnerPhase = "model_request" | "model_stream" | "tool_in_flight" | "awaiting_input" | "exited" | "unknown";
+
+export type ExecutionLifetime = { mode: "unbounded" } | { mode: "bounded"; timeoutMs: number };
+
 export interface Details {
 	mode: SubagentResultMode | "management";
 	workflowReceiptPath?: string;
@@ -1434,6 +1450,7 @@ export interface Details {
 	asyncId?: string;
 	background?: boolean;
 	asyncDir?: string;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
@@ -1587,6 +1604,10 @@ export interface NestedStepSummary {
 	transcriptPath?: string;
 	transcriptError?: string;
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolStartedAt?: number;
@@ -1642,6 +1663,10 @@ export interface NestedRunSummary extends NestedRunAddress {
 	steps?: NestedStepSummary[];
 	children?: NestedRunSummary[];
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolStartedAt?: number;
@@ -1653,6 +1678,7 @@ export interface NestedRunSummary extends NestedRunAddress {
 	startedAt?: number;
 	endedAt?: number;
 	lastUpdate?: number;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
@@ -1699,6 +1725,7 @@ export interface AsyncStartedEvent {
 	launchResolvedExtensions?: LaunchResolvedChildExtensions;
 	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	usageBudget?: UsageBudgetState;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	turnBudget?: TurnBudgetState;
@@ -1858,6 +1885,10 @@ export interface AsyncStatus {
 	displayDismissedAt?: number;
 	error?: string;
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolStartedAt?: number;
@@ -1868,6 +1899,7 @@ export interface AsyncStatus {
 	startedAt: number;
 	endedAt?: number;
 	lastUpdate?: number;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
@@ -1943,6 +1975,10 @@ export interface AsyncStatus {
 		transcriptPath?: string;
 		transcriptError?: string;
 		activityState?: ActivityState;
+		runnerPhase?: RunnerPhase;
+		runnerPhaseObservedAt?: number;
+		lastModelActivityAt?: number;
+		lastToolActivityAt?: number;
 		lastActivityAt?: number;
 		currentTool?: string;
 		currentToolArgs?: string;
@@ -2023,6 +2059,10 @@ export interface AsyncJobState {
 	sessionId?: string;
 	completionOwnerId?: string;
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolStartedAt?: number;
@@ -2050,6 +2090,7 @@ export interface AsyncJobState {
 	activeParallelGroup?: boolean;
 	startedAt?: number;
 	updatedAt?: number;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
@@ -2086,6 +2127,10 @@ export interface ForegroundResumeChild {
 	thinking?: string;
 	status: SubagentResultStatus;
 	activityState?: ActivityState;
+	runnerPhase?: RunnerPhase;
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	lastActivityAt?: number;
 	currentTool?: string;
 	currentToolStartedAt?: number;
@@ -2110,6 +2155,7 @@ export interface ForegroundResumeChild {
 	agentContract?: AgentContract;
 	/** Private bounded launch fields needed to preserve the child contract on resume. */
 	resumeContract?: {
+		executionLifetime?: ExecutionLifetime;
 		modelResponseAliases?: Record<string, string[]>;
 		outputSchema?: JsonSchemaObject | false;
 		agentContract?: AgentContract;
@@ -2400,6 +2446,7 @@ export interface ForegroundChildSessionControls {
 }
 
 export interface RunSyncOptions {
+	executionLifetime?: ExecutionLifetime;
 	/** Exact discovery provenance for an unknown-agent error; omission uses defensive fallback discovery. */
 	unknownAgentDiagnosticContext?: import("../agents/agents.ts").UnknownAgentDiagnosticContext;
 	/** Session factory for the in-process child; defaults to the process-wide factory. */
@@ -2425,6 +2472,7 @@ export interface RunSyncOptions {
 	requestedCwd?: string;
 	signal?: AbortSignal;
 	interruptSignal?: AbortSignal;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	/** Per-call per-tool timeout (ms), resolved with the agent/config/environment ladder at execution. */

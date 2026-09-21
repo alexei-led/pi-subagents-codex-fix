@@ -1,3 +1,6 @@
+import { observeRunnerPhase } from "../shared/runner-phase.ts";
+import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
+import type { ExecutionLifetime } from "../../shared/types.ts";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -205,6 +208,8 @@ export interface SubagentRunConfig {
 	workflowGraph?: WorkflowGraphSnapshot;
 	nestedRoute?: NestedRouteInfo;
 	nestedSelf?: { parentRunId: string; parentStepIndex?: number; depth: number; path?: Array<{ runId: string; stepIndex?: number; agent?: string }> };
+	executionLifetime?: ExecutionLifetime;
+	effectiveExecutionLifetime?: ExecutionLifetime;
 	timeoutMs?: number;
 	deadlineAt?: number;
 	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
@@ -1851,6 +1856,12 @@ export async function runSubagent(
 	config: SubagentRunConfig,
 	childSessions: ChildSessionFactory,
 ): Promise<void> {
+	const lifetime = resolveExecutionLifetime(config.executionLifetime ?? config.effectiveExecutionLifetime, config.timeoutMs);
+	if (lifetime.error) throw new Error(lifetime.error);
+	config = { ...config, effectiveExecutionLifetime: lifetime.effectiveExecutionLifetime, timeoutMs: lifetime.timeoutMs, deadlineAt: lifetime.timeoutMs === undefined ? undefined : config.deadlineAt ?? Date.now() + lifetime.timeoutMs };
+	if (config.executionLifetime !== undefined) {
+		for (const step of flattenSteps(config.steps)) step.timeoutMs = lifetime.timeoutMs;
+	}
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
 	const globalSemaphore = new Semaphore(config.globalConcurrencyLimit ?? DEFAULT_GLOBAL_CONCURRENCY_LIMIT);
@@ -2023,6 +2034,7 @@ export async function runSubagent(
 		lastActivityAt: overallStartTime,
 		startedAt: overallStartTime,
 		lastUpdate: overallStartTime,
+		effectiveExecutionLifetime: config.effectiveExecutionLifetime,
 		...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
 		...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
 		...(config.toolBudget ? { toolBudget: initialToolBudgetState(config.toolBudget) } : {}),
@@ -2952,6 +2964,7 @@ export async function runSubagent(
 		const step = statusPayload.steps[flatIndex];
 		if (!step) return;
 		const previousActivityState = step.activityState;
+		const previousRunnerPhase = step.runnerPhase;
 		const now = Date.now();
 		statusPayload.currentStep = flatIndex;
 		if (isChildWatchdogStatusEvent(event)) {
@@ -3105,6 +3118,21 @@ export async function runSubagent(
 			statusPayload.turnCount = Math.max(statusPayload.turnCount ?? 0, step.turnCount);
 		}
 		syncTopLevelCurrentTool();
+		step.runnerPhase = observeRunnerPhase(event, step.runnerPhase, step.currentTool ? { awaitingInput: [...(activeToolCalls[flatIndex]?.values() ?? [])].some((tool) => tool.blocksSupervisor) } : undefined);
+		if (step.runnerPhase !== previousRunnerPhase) step.runnerPhaseObservedAt = now;
+		if (event.type === "message_update" || (event.type === "message_start" && event.message?.role === "assistant")) {
+			step.lastModelActivityAt = now;
+			statusPayload.lastModelActivityAt = now;
+		}
+		if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+			step.lastToolActivityAt = now;
+			statusPayload.lastToolActivityAt = now;
+		}
+		const observedStep = statusPayload.steps.find((candidate) => candidate.status === "running" && candidate.runnerPhase === "awaiting_input")
+			?? statusPayload.steps.find((candidate) => candidate.status === "running" && candidate.currentTool)
+			?? step;
+		statusPayload.runnerPhase = observedStep.runnerPhase;
+		statusPayload.runnerPhaseObservedAt = observedStep.runnerPhaseObservedAt;
 		step.lastActivityAt = now;
 		statusPayload.lastActivityAt = now;
 		statusPayload.lastUpdate = now;
@@ -4933,6 +4961,7 @@ export async function runSubagent(
 			success: statusPayload.state === "complete",
 			state: statusPayload.state,
 			summary: stopped ? stopMessage : signalTerminated ? (statusPayload.error ?? "Subagent process terminated by signal.") : timedOut ? (timeoutMessage ?? "Subagent timed out.") : usageBudgetExceeded ? (statusPayload.error ?? "Usage budget exhausted.") : interrupted ? "Paused after interrupt. Waiting for explicit next action." : statusPayload.state === "partial" ? (statusPayload.error ?? summary) : summary,
+			effectiveExecutionLifetime: config.effectiveExecutionLifetime,
 			...(config.timeoutMs !== undefined ? { timeoutMs: config.timeoutMs } : {}),
 			...(config.deadlineAt !== undefined ? { deadlineAt: config.deadlineAt } : {}),
 			...(statusPayload.toolBudget ? { toolBudget: statusPayload.toolBudget } : {}),

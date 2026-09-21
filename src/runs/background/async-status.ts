@@ -92,6 +92,11 @@ interface AsyncRunStepSummary {
 }
 
 export interface AsyncRunSummary {
+	effectiveExecutionLifetime?: AsyncStatus["effectiveExecutionLifetime"];
+	runnerPhase?: AsyncStatus["runnerPhase"];
+	runnerPhaseObservedAt?: number;
+	lastModelActivityAt?: number;
+	lastToolActivityAt?: number;
 	id: string;
 	asyncDir: string;
 	toolCallId?: string;
@@ -397,7 +402,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		};
 	});
 	attachRootChildrenToSteps(status.runId || path.basename(asyncDir), summarizedSteps, nestedChildren);
-	return {
+	const summary: AsyncRunSummary = {
 		id: status.runId || path.basename(asyncDir),
 		asyncDir,
 		...(status.toolCallId ? { toolCallId: status.toolCallId } : {}),
@@ -455,6 +460,9 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		...(status.usageBudget ? { usageBudget: status.usageBudget } : {}),
 		...(status.sessionFile ? { sessionFile: status.sessionFile } : {}),
 	};
+	if (status.runnerPhase) Object.assign(summary, { runnerPhase: status.runnerPhase, runnerPhaseObservedAt: status.runnerPhaseObservedAt, lastModelActivityAt: status.lastModelActivityAt, lastToolActivityAt: status.lastToolActivityAt });
+	if (status.effectiveExecutionLifetime) summary.effectiveExecutionLifetime = status.effectiveExecutionLifetime;
+	return summary;
 }
 
 export function summarizeAsyncStatus(asyncDir: string, status: AsyncStatus & { cwd?: string }): AsyncRunSummary {
