@@ -692,10 +692,6 @@ interface KernelRunnerLaunch {
 async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunnerResult> {
 	try {
 		const prepared = await prepareKernelOwnedProcess(input.request);
-		writeNativeKernelMapping(prepared.operationDirectory, {
-			version: 1, runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId, asyncDir: input.asyncDir,
-			kernelBinding: { operationId: prepared.operationId, requestDigest: prepared.requestDigest, hostId: prepared.hostId, bootId: prepared.bootId },
-		});
 		if (fs.existsSync(path.join(path.dirname(prepared.operationDirectory), "cancel.json"))) {
 			await cancelKernelOwnedProcess(prepared.operationDirectory, { deadlineMs: 1_000 });
 			return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: "Operation cancelled before kernel runner dispatch.", startupDidNotProceed: true };
@@ -707,6 +703,10 @@ async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunner
 			processTerminal: { version: 1, state: "pending", runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId },
 		});
 		updateActiveRunIndex(input.asyncDir, "queued", input.initialStatus.toolCallId);
+		writeNativeKernelMapping(prepared.operationDirectory, {
+			version: 1, runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId, asyncDir: input.asyncDir,
+			kernelBinding: { operationId: prepared.operationId, requestDigest: prepared.requestDigest, hostId: prepared.hostId, bootId: prepared.bootId },
+		});
 		writeRunnerStartupControl(input.startupProceedPath, { action: "proceed", token: input.runnerProcessInstanceId });
 		const handle = await launchKernelOwnedProcess(input.request);
 		const pid = handle.workloadIdentity?.pid;
@@ -715,7 +715,8 @@ async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunner
 		const monitor = setInterval(() => {
 			if (observing) return;
 			observing = true;
-			void observeNativeKernelRun(prepared.operationDirectory, input.runId).then(({ processTerminalProof }) => {
+			void observeNativeKernelRun(prepared.operationDirectory, input.runId).then(({ processTerminalProof, neverStarted }) => {
+				if (neverStarted) { clearInterval(monitor); return; }
 				if (processTerminalProof.state !== "observed") return;
 				writePrivateAtomicJson(path.join(input.asyncDir, "process-terminal.json"), processTerminalProof);
 				input.onProcessTerminal?.(processTerminalProof);
