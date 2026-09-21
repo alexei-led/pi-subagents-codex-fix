@@ -63,6 +63,24 @@ function request(events: Events, method: SubagentRpcMethod, params: OperationReq
 
 const launch = { operationId: "operation-1", digest: "digest-1", agent: "worker", task: "Work", executionLifetime: { mode: "unbounded" } } satisfies OperationRequest;
 
+it("keeps the guarded anchor owner immutable and rejects stale owner-death evidence", t => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "guarded-anchor-"));
+	t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+	const original = new DurableOperation(root, root, launch.operationId);
+	const owner = { pid: 123, uniqueId: "1234", pidVersion: 1, hostId: "host", bootId: "boot" };
+	const claim = { digest: launch.digest, requestHash: "request", dispatchArbitration: 1 as const, launchOwner: owner };
+	assert.equal(original.claim(claim), true);
+	fs.rmSync(path.join(original.directory, "intent.json"));
+	const alternate = new DurableOperation(root, root, launch.operationId);
+	const otherOwner = { ...owner, pid: 456, uniqueId: "5678" };
+	assert.equal(alternate.claim({ ...claim, launchOwner: otherOwner }), false);
+	assert.deepEqual(alternate.intent()?.launchOwner, owner);
+	assert.equal(alternate.rejectGuardedDispatch(otherOwner), false);
+	assert.equal(alternate.dispatchPending(), true);
+	assert.equal(alternate.rejectGuardedDispatch(owner), true);
+	assert.equal(alternate.rejectedBeforeDispatch(), true);
+});
+
 for (const kind of ["proven", "unclassified", "foreign-run"] as const) it(`preserves pre-dispatch rejection evidence without replaying the launch (${kind})`, async t => {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "durable-rejection-"));
 	t.after(() => fs.rmSync(root, { recursive: true, force: true }));

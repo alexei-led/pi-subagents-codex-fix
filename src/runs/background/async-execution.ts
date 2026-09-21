@@ -2,6 +2,7 @@ import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import type { ExecutionLifetime, ExecutionOwnership, ProcessTerminal } from "../../shared/types.ts";
 import { launchKernelOwnedProcess, prepareKernelOwnedProcess, cancelKernelOwnedProcess, inspectInheritedKernelOwnedProcessMembership, type KernelOwnedProcessRequest } from "../../api/kernel-owned-process.mjs";
 import { observeNativeKernelRun, writeNativeKernelMapping } from "./runtime-ownership.ts";
+import { claimNativeOperationDispatch } from "./durable-operation.ts";
 import { ownedGitEnvironment } from "../shared/owned-git-environment.ts";
 /**
  * Async execution logic for subagent tool
@@ -703,6 +704,10 @@ async function spawnKernelRunner(input: KernelRunnerLaunch): Promise<SpawnRunner
 			version: 1, runId: input.runId, runnerProcessInstanceId: input.runnerProcessInstanceId, asyncDir: input.asyncDir,
 			kernelBinding: { operationId: prepared.operationId, requestDigest: prepared.requestDigest, hostId: prepared.hostId, bootId: prepared.bootId },
 		});
+		if (!claimNativeOperationDispatch(prepared.operationDirectory, input.runId)) {
+			await cancelKernelOwnedProcess(prepared.operationDirectory, { deadlineMs: 1_000 });
+			return { error: "Operation was rejected before runner dispatch.", startupDidNotProceed: true };
+		}
 		if (fs.existsSync(path.join(path.dirname(prepared.operationDirectory), "cancel.json"))) {
 			await cancelKernelOwnedProcess(prepared.operationDirectory, { deadlineMs: 1_000 });
 			return { runnerProcessInstanceId: input.runnerProcessInstanceId, error: "Operation cancelled before kernel runner dispatch.", startupDidNotProceed: true };
@@ -867,6 +872,7 @@ function spawnRunner(cfg: object, suffix: string, cwd: string, initialStatus: Om
 				asyncDir: launchAsyncDir, runId: launchRunId, runnerProcessInstanceId, initialStatus, initialStatusPath, startupProceedPath, onBeforeProceed, onProcessTerminal,
 			});
 		}
+		if (requestedOwnership?.mode === "kernel" && ownershipConfig.kernelOperationDirectory && !claimNativeOperationDispatch(ownershipConfig.kernelOperationDirectory, launchRunId)) return { error: "Operation was rejected before runner dispatch.", startupDidNotProceed: true };
 		const proc = spawn(command, args, {
 			cwd,
 			...backgroundProcessOptions(),

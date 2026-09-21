@@ -30,7 +30,7 @@ import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsync
 import { DurableOperation, operationRequestHash } from "../runs/background/durable-operation.ts";
 import { readProcessTerminal } from "../runs/background/process-terminal.ts";
 import { readWorkflowTerminalProof } from "../runs/background/workflow-terminal.ts";
-import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, readNativeKernelMapping, probeRuntimeOwnership } from "../runs/background/runtime-ownership.ts";
+import { FULL_PROCESS_TREE_OWNERSHIP, observeNativeKernelRun, readNativeKernelMapping, probeRuntimeOwnership, currentNativeLauncherOwner, nativeLauncherGone } from "../runs/background/runtime-ownership.ts";
 import { cancelKernelOwnedProcess, type KernelOwnedProcessCapability } from "../api/kernel-owned-process.mjs";
 import { parseOwnedWorkflow, validateOwnedWorkflowPublicFields } from "../runs/shared/owned-workflow.ts";
 
@@ -833,6 +833,16 @@ async function stopOperation(operation: DurableOperation, options: RegisterSubag
 	stopOwnedRunTree(intent.runId, observation.asyncDir, intent.sessionId, options, ctx, new Set());
 }
 
+async function reconcileOperationClaim(operation: DurableOperation, options: RegisterSubagentRpcBridgeOptions, activeOperations: Map<string, AbortController>) {
+	const observation = await observeOperation(operation, options);
+	const owner = operation.intent()?.launchOwner;
+	if (!activeOperations.has(operation.directory) && operation.dispatchPending() && owner && await nativeLauncherGone(owner, await probeRuntimeOwnership(path.join(operationStorageRoot(options), "kernel-cache"))) && operation.rejectGuardedDispatch(owner)) {
+		operation.complete({ isError: true, text: "Launch recovery fenced the operation before runner dispatch.", details: { mode: "single", results: [], admission: { version: 1, state: "rejected-before-dispatch", runId: operation.runId, reason: "launch-validation-rejected" } } });
+		return observeOperation(operation, options);
+	}
+	return observation;
+}
+
 async function handleOperation(
 	request: SubagentRpcRequestEnvelope,
 	options: RegisterSubagentRpcBridgeOptions,
@@ -845,10 +855,11 @@ async function handleOperation(
 	if (intent && digest !== undefined && intent.digest !== digest) throw new SubagentRpcError("invalid_params", "Operation digest does not match its durable intent.");
 	if (request.method === "lookup") {
 		if (operation.cancelled()) await stopOperation(operation, options, ctx);
-		return observeOperation(operation, options);
+		return reconcileOperationClaim(operation, options, activeOperations);
 	}
 	if (request.method === "cancel") {
 		operation.cancel(digest!);
+		operation.rejectGuardedDispatch();
 		activeOperations.get(operation.directory)?.abort(new Error("Operation cancelled."));
 		await stopOperation(operation, options, ctx);
 		return observeOperation(operation, options);
@@ -893,11 +904,15 @@ async function handleOperation(
 	const claim: Parameters<DurableOperation["claim"]>[0] = { digest: digest!, requestHash, sessionId: resolveCurrentSessionId(ctx.sessionManager) };
 	if (params.executionLifetime !== undefined) claim.effectiveExecutionLifetime = params.executionLifetime;
 	if (params.executionOwnership?.mode === "kernel") {
-		if (!intent) {
+		if (process.env.PI_KERNEL_OWNED_OPERATION) throw new SubagentRpcError("invalid_state", "Correlated kernel RPC roots require an external host; use native nested delegation inside an owned root.");
+		if (!operation.hasPersistedClaim()) {
 			const capability = await probeRuntimeOwnership(path.join(operationStorageRoot(options), "kernel-cache"));
 			if (!capability.supported) throw new SubagentRpcError("invalid_state", `Kernel process ownership is unavailable: ${capability.reason ?? "platform preflight failed"}`);
+			claim.launchOwner = await currentNativeLauncherOwner(capability);
+			if (!claim.launchOwner) throw new SubagentRpcError("invalid_state", "Kernel launch owner identity is unavailable.");
 		}
 		claim.effectiveExecutionOwnership = params.executionOwnership;
+		claim.dispatchArbitration = 1;
 		claim.executionRoute = params.ownedWorkflow !== undefined ? "parallel-data" : "single-async";
 		if (params.ownedWorkflowKeys) claim.ownedWorkflowKeys = params.ownedWorkflowKeys;
 	}
@@ -905,16 +920,21 @@ async function handleOperation(
 	if (!claimed) {
 		const winner = operation.intent();
 		if (!winner || winner.digest !== digest || (winner.requestHash !== undefined && winner.requestHash !== requestHash)) throw new SubagentRpcError("invalid_params", "Concurrent operation launch does not match its durable intent.");
-		return observeOperation(operation, options);
+		return reconcileOperationClaim(operation, options, activeOperations);
 	}
 	if (operation.cancelled()) return observeOperation(operation, options);
 	const controller = new AbortController();
 	activeOperations.set(operation.directory, controller);
 	try {
 		const result = await options.execute(`rpc-spawn-${request.requestId}`, { ...params, rpcOperationRunId: operation.runId, rpcKernelOperationDirectory: path.join(operation.directory, "owned") }, controller.signal, undefined, ctx);
-		if (result.isError && admissionRejectionValidator.Check(result.details?.admission) && result.details.admission.runId === operation.runId) operation.rejectBeforeDispatch(operation.runId, result.details.admission.reason);
+		if (result.isError && operation.rejectGuardedDispatch()) result.details.admission = { version: 1, state: "rejected-before-dispatch", runId: operation.runId, reason: "launch-validation-rejected" };
+		else if (result.isError && admissionRejectionValidator.Check(result.details?.admission) && result.details.admission.runId === operation.runId) operation.rejectBeforeDispatch(operation.runId, result.details.admission.reason);
 		operation.complete(dataFromToolResult(result));
 		if (operation.cancelled()) await stopOperation(operation, options, ctx);
+		return observeOperation(operation, options);
+	} catch (cause) {
+		if (!operation.rejectGuardedDispatch()) throw cause;
+		operation.complete({ isError: true, text: cause instanceof Error ? cause.message : String(cause), details: { mode: "single", results: [], admission: { version: 1, state: "rejected-before-dispatch", runId: operation.runId, reason: "launch-validation-rejected" } } });
 		return observeOperation(operation, options);
 	} finally {
 		activeOperations.delete(operation.directory);
@@ -928,7 +948,7 @@ async function handleRequest(
 	activeOperations: Map<string, AbortController>,
 ): Promise<unknown> {
 	const ctx = options.getContext();
-	if (request.method === "ping") return pingData(ctx, ctx ? await probeRuntimeOwnership(path.join(operationStorageRoot(options), "kernel-cache")) : undefined);
+	if (request.method === "ping") return pingData(ctx, ctx ? (process.env.PI_KERNEL_OWNED_OPERATION ? { supported: false, reason: "Correlated kernel RPC roots require an external host." } : await probeRuntimeOwnership(path.join(operationStorageRoot(options), "kernel-cache"))) : undefined);
 	if (!ctx) throw new SubagentRpcError("no_active_session", "No active extension context for subagent RPC.");
 	if (request.method === "lookup" || request.method === "cancel" || request.method === "diagnose" || (request.method === "spawn" && isRecord(request.params) && (request.params.operationId !== undefined || request.params.digest !== undefined || request.params.executionOwnership !== undefined))) return handleOperation(request, options, ctx, activeOperations);
 

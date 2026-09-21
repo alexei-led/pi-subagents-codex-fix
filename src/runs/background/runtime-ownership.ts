@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFile } from "node:child_process";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
 import {
@@ -7,6 +8,7 @@ import {
 	type KernelOperationBinding, type KernelOwnedProcessCapability, type KernelOwnedProcessObservation,
 } from "../../api/kernel-owned-process.mjs";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
+import { claimNativeOperationDispatch, type NativeLauncherOwner } from "./durable-operation.ts";
 import { readStatus } from "../../shared/utils.ts";
 
 export const FULL_PROCESS_TREE_OWNERSHIP = { version: 1, scope: "owned-process-tree", escapedDescendants: "contained" } as const;
@@ -16,6 +18,7 @@ const nativeIntentValidator = Compile(Type.Object({ operationId: Type.String(), 
 const nativeStopValidator = Compile(Type.Object({ runId: Type.String(), requestedAt: Type.Number() }));
 const mappingValidator = Compile(Type.Object({ version: Type.Literal(1), runId: Type.String(), runnerProcessInstanceId: Type.String(), asyncDir: Type.String(), kernelBinding: bindingSchema, nativeOperation: Type.Optional(nativeOperationSchema) }));
 const processIdentitySchema = Type.Object({ pid: Type.Integer({ minimum: 1 }), uniqueId: Type.String({ minLength: 1 }), pidVersion: Type.Integer({ minimum: 0 }) });
+const launcherObservationValidator = Compile(Type.Union([Type.Object({ ok: Type.Literal(true), identity: processIdentitySchema }), Type.Object({ ok: Type.Literal(false), errno: Type.Number() })]));
 const identitySchema = Type.Object({ ...bindingSchema.properties, version: Type.Literal(1), backend: Type.Literal("darwin-resource-coalition-v1"), coalitionId: Type.String({ minLength: 1 }), leader: processIdentitySchema });
 const kernelTerminalValidator = Compile(Type.Object({
 	version: Type.Literal(1), state: Type.Literal("observed"), runId: Type.String({ minLength: 1 }), runnerProcessInstanceId: Type.String({ minLength: 1 }), observedAt: Type.Number(),
@@ -86,6 +89,30 @@ export async function probeRuntimeOwnership(artifactDirectory: string): Promise<
 	} finally { if (timeout) clearTimeout(timeout); }
 }
 
+async function inspectLauncher(capability: KernelOwnedProcessCapability, pid: number) {
+	if (!capability.supported || !capability.nativeExecutable || !capability.hostId || !capability.bootId) return undefined;
+	return new Promise<ReturnType<typeof launcherObservationValidator.Parse> | undefined>(resolve => {
+		execFile(capability.nativeExecutable!, ["inspect", String(pid)], { timeout: 1_000, maxBuffer: 65_536, encoding: "utf8" }, (_error, stdout) => {
+			try { const value: unknown = JSON.parse(stdout); resolve(launcherObservationValidator.Check(value) ? value : undefined); } catch { resolve(undefined); }
+		});
+	});
+}
+
+export async function currentNativeLauncherOwner(capability: KernelOwnedProcessCapability): Promise<NativeLauncherOwner | undefined> {
+	const observation = await inspectLauncher(capability, process.pid);
+	if (!observation?.ok || !capability.hostId || !capability.bootId) return undefined;
+	return { ...observation.identity, hostId: capability.hostId, bootId: capability.bootId };
+}
+
+export async function nativeLauncherGone(owner: NativeLauncherOwner, capability: KernelOwnedProcessCapability): Promise<boolean> {
+	if (!capability.supported || capability.hostId !== owner.hostId || !capability.bootId) return false;
+	if (capability.bootId !== owner.bootId) return true;
+	const observation = await inspectLauncher(capability, owner.pid);
+	if (!observation) return false;
+	if (!observation.ok) return observation.errno === 3;
+	return observation.identity.uniqueId !== owner.uniqueId || observation.identity.pidVersion !== owner.pidVersion;
+}
+
 export function writeNativeKernelMapping(operationDirectory: string, mapping: NativeKernelMapping): void {
 	try {
 		const intent: unknown = JSON.parse(fs.readFileSync(path.join(path.dirname(operationDirectory), "intent.json"), "utf8"));
@@ -116,11 +143,15 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 		|| (observation.exitCode === 0 && (!status || status.state === "running" || status.state === "queued"));
 	if (bindingVerified && (runnerFailed || outerStopRequested || nativeStopRequested || status?.stopped === true) && (observation.status === "active" || observation.status === "pending")) observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
 	else if (mapping && bindingVerified && observation.exitCode === undefined && (observation.status === "pending" || observation.status === "active")) {
-		const permissionPath = path.join(mapping.asyncDir, "runner-startup-proceed.json");
-		if (!fs.existsSync(permissionPath) && !fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) && !fs.existsSync(path.join(operationDirectory, "native-stop.json"))) {
-			writePrivateAtomicJson(permissionPath, { action: "proceed", token: mapping.runnerProcessInstanceId });
+		if (!claimNativeOperationDispatch(operationDirectory, runId)) {
+			observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
+		} else {
+			const permissionPath = path.join(mapping.asyncDir, "runner-startup-proceed.json");
+			if (!fs.existsSync(permissionPath) && !fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) && !fs.existsSync(path.join(operationDirectory, "native-stop.json"))) {
+				writePrivateAtomicJson(permissionPath, { action: "proceed", token: mapping.runnerProcessInstanceId });
+			}
+			if (observation.status === "pending" && !fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) && !fs.existsSync(path.join(operationDirectory, "native-stop.json"))) observation = await reconcileKernelOwnedProcess(operationDirectory);
 		}
-		if (observation.status === "pending" && !fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) && !fs.existsSync(path.join(operationDirectory, "native-stop.json"))) observation = await reconcileKernelOwnedProcess(operationDirectory);
 	}
 	let proof: NativeKernelTerminalProof = { version: 1, state: "unknown", runId, runnerProcessInstanceId: mapping?.runnerProcessInstanceId ?? "unknown", reason: "Kernel ownership mapping or retirement evidence is unavailable." };
 	const binding = mapping?.kernelBinding;

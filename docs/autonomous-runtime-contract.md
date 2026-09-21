@@ -93,10 +93,19 @@ atomic launch arbitration before dispatch. Otherwise callers must observe exit
 evidence. Repeated lookup/cancel requests retry stop delivery when startup races
 with cancellation.
 
-A root request rejected during agent resolution also records a correlated
-pre-dispatch receipt and reports `neverStarted: true`. The immutable launch claim
-remains consumed, so concurrent or delayed replays cannot dispatch it. Generic
-errors, absent files, and unclassified failures do not imply this evidence.
+New kernel RPC launches arbitrate dispatch against rejection using one durable,
+identity-bound decision. The runtime publishes the recoverable kernel request and
+native mapping before claiming dispatch. Early validation and startup rejection
+can report `neverStarted: true` only after atomically fencing that gate; late and
+concurrent continuations cannot bypass it. Once dispatch wins, generic errors and
+missing files do not establish no-start evidence.
+
+Recovery resumes a prepared request under its original identity. A bare claim can
+be fenced automatically only when the recorded launcher's host, boot, and kernel
+process incarnation prove that owner has exited or been replaced. Another host's
+lookup leaves a live owner pending. Explicit cancellation can fence a pending gate
+immediately. Correlated kernel RPC roots require an external host; native nested
+delegation continues inside its validated inherited root.
 
 For kernel-owned launches, observed `processTerminalProof` includes the full
 `processTreeOwnership` descriptor, `nativeOperation: { operationId, digest }`,

@@ -1433,7 +1433,7 @@ export type ExecutionOwnership = { mode: "kernel" };
 export type ExecutionLifetime = { mode: "unbounded" } | { mode: "bounded"; timeoutMs: number };
 
 export interface Details {
-	admission?: { version: 1; state: "rejected-before-dispatch"; runId: string; reason: "agent-resolution-rejected" };
+	admission?: { version: 1; state: "rejected-before-dispatch"; runId: string; reason: "agent-resolution-rejected" | "launch-validation-rejected" };
 	kernelOperationDirectory?: string;
 	effectiveExecutionOwnership?: ExecutionOwnership;
 	ownedWorkflowKeys?: string[];
