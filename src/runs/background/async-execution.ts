@@ -2097,6 +2097,8 @@ export function executeAsyncSingle(
 	});
 	const recoveryAgentConfig = params.recoveryAgentConfig ?? agentConfig;
 	const recoveryDescriptor: SteeringRecoveryDescriptor = {
+		executionOwnership: params.executionOwnership,
+		kernelOperationDirectory: params.executionOwnership?.mode === "kernel" && !process.env.PI_KERNEL_OWNED_OPERATION ? path.resolve(params.kernelOperationDirectory ?? path.join(getAgentDir(), "subagent-runtime", "owned", id)) : params.kernelOperationDirectory,
 		executionLifetime: params.executionLifetime,
 		effectiveExecutionLifetime,
 		...(ctx.modelResponseAliases ? { modelResponseAliases: ctx.modelResponseAliases } : {}),

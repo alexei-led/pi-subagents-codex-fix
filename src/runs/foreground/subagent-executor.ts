@@ -88,7 +88,7 @@ import {
 	resolveSubagentResultStatus,
 	stripDetailsOutputsForIntercomReceipt,
 } from "../../intercom/result-intercom.ts";
-import { applySteeringRecoveryAgentConfig, asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, readAsyncRecoveryDescriptor, resolveAsyncResumeTarget, resolveAsyncRunLocation } from "../background/async-resume.ts";
+import { applySteeringRecoveryAgentConfig, asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, readAsyncRecoveryDescriptor, readAsyncRecoveryOwnership, resolveAsyncResumeTarget, resolveAsyncRunLocation } from "../background/async-resume.ts";
 import { closeSteerInbox, consumeSteerRequests, deliverInterruptRequest, readRevivalBriefs, requestAsyncSteer, watchAsyncControlInbox, type SteerDeliveryMode, type SteerRequest } from "../background/control-channel.ts";
 import { createSteeringStatus, recordSteeringRequest, steeringStatus, updateSteeringTarget, waitForSteeringAction } from "../background/steering.ts";
 import { canQueueRetainedAsyncFollowUp, steerAsyncRun } from "./async-steering-action.ts";
@@ -781,6 +781,7 @@ function rememberForegroundRun(state: SubagentState, input: { modelResponseAlias
 		updatedAt,
 		children: input.results.map((result, index) => {
 			const resumeContract = omitUndefinedProperties({
+				executionOwnership: input.params.executionOwnership,
 				executionLifetime: input.params.executionLifetime,
 				modelResponseAliases: input.modelResponseAliases,
 				outputSchema: input.params.outputSchema,
@@ -983,6 +984,7 @@ function resolveForegroundResumeTarget(params: SubagentParamsLike, state: Subage
 type AsyncResumeSourceTarget = ReturnType<typeof resolveAsyncResumeTarget> & { source: "async" };
 type ForegroundResumeSourceTarget = NonNullable<ReturnType<typeof resolveForegroundResumeTarget>> & { kind: "revive"; source: "foreground" };
 type NestedResumeSourceTarget = {
+	recoveryOwnership?: "kernel" | "unknown";
 	kind: "revive";
 	source: "nested";
 	runId: string;
@@ -1517,6 +1519,7 @@ function resolveNestedResumeTarget(match: ResolvedSubagentRunId & { kind: "neste
 	const state = run.state === "complete" || run.state === "failed" || run.state === "paused" ? run.state : "failed";
 	const asyncDir = resolveNestedAsyncDir(match.match.rootRunId, run);
 	const recoveryDescriptor = readNestedRecoveryDescriptor(asyncDir, run.id, agent);
+	const recoveryOwnership = readAsyncRecoveryOwnership(asyncDir, run.id, recoveryDescriptor) ?? readAsyncRecoveryOwnership(path.join(DIRS.async, match.match.rootRunId), match.match.rootRunId);
 	return compactOptional<NestedResumeSourceTarget>({
 		kind: "revive",
 		source: "nested",
@@ -1528,6 +1531,7 @@ function resolveNestedResumeTarget(match: ResolvedSubagentRunId & { kind: "neste
 		sessionFile: validateNestedSessionFile(run, trustedSessionRoots),
 		...(run.capabilityCeiling ? { capabilityCeiling: run.capabilityCeiling } : {}),
 		...(recoveryDescriptor ? { recoveryDescriptor } : {}),
+		recoveryOwnership,
 	});
 }
 
@@ -1877,6 +1881,13 @@ async function resumeAsyncRun(input: {
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
+	}
+	const recoveryOwnership = "recoveryOwnership" in target ? target.recoveryOwnership : undefined;
+	const retainedOwnership = target.source === "foreground" ? target.resumeContract?.executionOwnership : target.recoveryDescriptor?.executionOwnership;
+	if (recoveryOwnership || retainedOwnership?.mode === "kernel" || input.params.executionOwnership?.mode === "kernel") {
+		return buildRequestedModeError(input.params, recoveryOwnership === "unknown"
+			? "Run ownership is unknown; ordinary revival is blocked. Verify predecessor retirement and start a fresh correlated owned operation."
+			: "Kernel-owned runs cannot use ordinary revival. Verify predecessor retirement and start a fresh correlated owned operation.");
 	}
 
 	const { blocked, depth, maxDepth } = checkSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime);

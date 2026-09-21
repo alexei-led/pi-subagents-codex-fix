@@ -95,6 +95,9 @@ describe("kernel-owned parallel data through the native executor", () => {
 				assert.equal(result.success, true, JSON.stringify(result));
 				assert.deepEqual(result.ownedWorkflowKeys, ["first", "second"]);
 				assert.deepEqual(result.results.map((child) => child.output), ["first owned result", "second owned result"]);
+				const revival = await executor.executePublic("resume-owned-parallel", { action: "resume", id: runId, index: 0, message: "Continue" }, new AbortController().signal, undefined, ctx);
+				assert.equal(revival.isError, true);
+				assert.equal(mockPi.callCount(), 2);
 			}
 			assert.deepEqual(fs.readdirSync(candidateDirectory), []);
 		});

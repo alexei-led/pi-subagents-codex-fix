@@ -41,6 +41,14 @@ directory and its operation ID, request digest, host ID, and boot ID. Nested
 launches validate every binding field and the current process's actual coalition
 membership before using the existing root.
 
+Recovery descriptors retain kernel ownership and the known operation directory.
+Ordinary revival of owned runs is rejected before session leases or runners are
+created, including retained workflow resumes and inherited foreground children.
+Missing descriptor fields cannot override ownership in status, indexed results,
+or kernel proof; malformed ownership evidence blocks revival. Continue with a
+fresh correlated owned operation after verifying predecessor retirement. Live
+follow-up control of an existing child remains available.
+
 Strict workers remove inherited Git repository selectors and injected per-command
 configuration before the kernel request is frozen. Author, committer, SSH, and
 authentication settings remain available. The parent environment is unchanged.

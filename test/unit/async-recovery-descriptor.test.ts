@@ -1,17 +1,47 @@
 import assert from "node:assert/strict";
 import childProcess from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { readAsyncRecoveryDescriptor } from "../../src/runs/background/async-resume.ts";
+import { readAsyncRecoveryDescriptor, readAsyncRecoveryOwnership } from "../../src/runs/background/async-resume.ts";
+import { writeResultIndexForData, removeResultIndex } from "../../src/runs/background/result-files.ts";
 import { executeAsyncSingle } from "../../src/runs/background/async-execution.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 import { DIRS } from "../../src/shared/types.ts";
 import { makeAgent } from "../support/helpers.ts";
 
 const budgetDirectories: string[] = [];
+
+it("retains owned evidence from an indexed result when recovery metadata is absent", () => {
+	const runId = randomUUID();
+	const sessionId = "owned-recovery-index";
+	const resultPath = path.join(DIRS.results, `indexed-${runId}.json`);
+	const payload = { runId, sessionId, state: "complete", effectiveExecutionOwnership: { mode: "kernel" } };
+	try {
+		fs.mkdirSync(DIRS.results, { recursive: true });
+		fs.writeFileSync(resultPath, JSON.stringify(payload));
+		writeResultIndexForData(resultPath, payload);
+		assert.equal(readAsyncRecoveryOwnership(undefined, runId), "kernel");
+	} finally { fs.rmSync(resultPath, { force: true }); removeResultIndex(DIRS.results, sessionId, runId); }
+});
+
+it("preserves kernel ownership and rejects malformed recovery ownership", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "owned-recovery-schema-"));
+	const descriptor = { version: 1, sourceRunId: "owned-run", runFanoutBudget: runFanoutBudget("owned-run"), agent: "worker", cwd: root, systemPromptMode: "replace", outputMode: "inline", inheritGlobalContext: false, inheritProjectContext: false, inheritSkills: false, maxSubagentDepth: 2, share: false, executionOwnership: { mode: "kernel" }, kernelOperationDirectory: path.join(root, "owned") };
+	const file = path.join(root, "recovery-descriptor.json");
+	try {
+		fs.writeFileSync(file, JSON.stringify(descriptor));
+		assert.deepEqual(readAsyncRecoveryDescriptor(root)?.executionOwnership, { mode: "kernel" });
+		assert.equal(readAsyncRecoveryDescriptor(root)?.kernelOperationDirectory, descriptor.kernelOperationDirectory);
+		for (const invalid of [{ executionOwnership: { mode: "legacy" } }, { executionOwnership: null }, { kernelOperationDirectory: "relative" }, { kernelOperationDirectory: 12 }, { executionOwnership: undefined }]) {
+			fs.writeFileSync(file, JSON.stringify({ ...descriptor, ...invalid }));
+			assert.throws(() => readAsyncRecoveryDescriptor(root), /ownership|executionOwnership|kernelOperationDirectory/);
+		}
+	} finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 function runFanoutBudget(runId: string) {
 	const descriptor = createRunFanoutBudget(runId, 64);

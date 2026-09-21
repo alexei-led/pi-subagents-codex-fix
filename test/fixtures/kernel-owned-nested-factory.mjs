@@ -37,6 +37,8 @@ export default function () {
         process.env.PI_KERNEL_OWNED_OPERATION = marker;
         const foreground = await executor.execute("nested-foreground", params, new AbortController().signal, undefined, ctx);
         assert.notEqual(foreground.isError, true, JSON.stringify(foreground));
+        const foregroundRevival = await executor.executePublic("revive-owned-foreground", { action: "resume", id: foreground.details.runId, message: "Continue" }, new AbortController().signal, undefined, ctx);
+        assert.equal(foregroundRevival.isError, true);
         const background = await executor.execute("nested-background", { ...params, task: "Nested background", async: true }, new AbortController().signal, undefined, ctx);
         assert.notEqual(background.isError, true, JSON.stringify(background));
         const statusPath = path.join(background.details.asyncDir, "status.json");

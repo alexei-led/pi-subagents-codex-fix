@@ -1,6 +1,12 @@
 import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Type } from "typebox";
+import { Compile } from "typebox/compile";
+import { validateExecutionOwnership } from "../shared/owned-workflow.ts";
+import { readStatus } from "../../shared/utils.ts";
+import { sanitizeProcessTerminal } from "./process-terminal.ts";
+import { validKernelTerminalProof } from "./runtime-ownership.ts";
 import { DIRS, type AcceptanceInput, type AsyncStatus, type SteeringRecoveryDescriptor, type SubagentRunMode } from "../../shared/types.ts";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { normalizeExtensionBindings } from "../shared/extension-bindings.ts";
@@ -40,6 +46,7 @@ export interface AsyncResumeOptions {
 }
 
 export type AsyncResumeTarget = {
+	recoveryOwnership?: "kernel" | "unknown";
 	kind: "live" | "revive";
 	runId: string;
 	asyncDir?: string;
@@ -64,6 +71,8 @@ export type AsyncResumeTarget = {
 };
 
 interface AsyncResultFile {
+	effectiveExecutionOwnership?: { mode: "kernel" };
+	kernelOperationDirectory?: string;
 	id?: string;
 	runId?: string;
 	agent?: string;
@@ -129,6 +138,8 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 	const success = data.success;
 	if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': success must be a boolean.`);
 	return {
+		effectiveExecutionOwnership: parseRecoveryOwnership(data.effectiveExecutionOwnership, resultPath),
+		kernelOperationDirectory: parseRecoveryKernelDirectory(data.kernelOperationDirectory, resultPath),
 		id: validateOptionalString(data, "id", resultPath),
 		runId: validateOptionalString(data, "runId", resultPath),
 		agent: validateOptionalString(data, "agent", resultPath),
@@ -165,6 +176,53 @@ function readResultFile(resultPath: string): AsyncResultFile {
 		}
 		throw error;
 	}
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Validates persisted ownership before it influences revival.
+function parseRecoveryOwnership(value: unknown, source: string): { mode: "kernel" } | undefined {
+	const error = validateExecutionOwnership(value);
+	if (error) throw new Error(`Invalid recovery ownership '${source}': ${error}`);
+	return value === undefined ? undefined : { mode: "kernel" };
+}
+
+const directoryValidator = Compile(Type.String({ minLength: 1 }));
+const kernelProofHintValidator = Compile(Type.Union([Type.Object({ processTreeOwnership: Type.Unknown() }), Type.Object({ kernelProof: Type.Unknown() }), Type.Object({ kernelBinding: Type.Unknown() })]));
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Parses persisted terminal evidence, including malformed records.
+function parseRecoveryProofOwnership(value: unknown, runId: string): "kernel" | "unknown" | undefined {
+	if (value === undefined) return undefined;
+	const proof = sanitizeProcessTerminal(value, { runId });
+	if (!proof || (proof.state === "unknown" && proof.reason === "proof-write-failed")) return "unknown";
+	if (kernelProofHintValidator.Check(value)) return validKernelTerminalProof(value) ? "kernel" : "unknown";
+	return undefined;
+}
+
+// oxlint-disable-next-line anti-slop/no-unknown-parameters -- Validates an optional directory read from recovery metadata.
+function parseRecoveryKernelDirectory(value: unknown, source: string): string | undefined {
+	if (value === undefined) return undefined;
+	if (!directoryValidator.Check(value) || !path.isAbsolute(value) || value.trim() !== value) throw new Error(`Invalid recovery ownership '${source}': kernelOperationDirectory must be an absolute directory.`);
+	return value;
+}
+
+export function readAsyncRecoveryOwnership(asyncDir: string | undefined, runId: string, descriptor?: SteeringRecoveryDescriptor, savedStatus?: AsyncStatus | null, savedResult?: AsyncResultFile): "kernel" | "unknown" | undefined {
+	const status = savedStatus === undefined && asyncDir ? readStatus(asyncDir) : savedStatus;
+	const resultPath = exactResultPath(DIRS.results, runId);
+	const result = savedResult ?? (resultPath ? readResultFile(resultPath) : undefined);
+	if ((status && status.runId !== runId) || (result && (result.runId ?? result.id) !== undefined && (result.runId ?? result.id) !== runId)) return "unknown";
+	for (const value of [descriptor?.executionOwnership, status?.effectiveExecutionOwnership, result?.effectiveExecutionOwnership]) if (parseRecoveryOwnership(value, runId)) return "kernel";
+	for (const value of [descriptor?.kernelOperationDirectory, status?.kernelOperationDirectory, result?.kernelOperationDirectory]) if (parseRecoveryKernelDirectory(value, runId)) return "kernel";
+	const embeddedOwnership = parseRecoveryProofOwnership(status?.processTerminal, runId);
+	if (embeddedOwnership) return embeddedOwnership;
+	if (asyncDir) {
+		const proofPath = path.join(asyncDir, "process-terminal.json");
+		if (fs.existsSync(proofPath)) {
+			try {
+				const proof: unknown = JSON.parse(fs.readFileSync(proofPath, "utf8"));
+				return parseRecoveryProofOwnership(proof, runId);
+			} catch { return "unknown"; }
+		}
+	}
+	return undefined;
 }
 
 function assertRunId(value: string | undefined, field: "id" | "runId"): string | undefined {
@@ -321,6 +379,7 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': expected an object.`);
 	const parsed = value as Record<string, unknown>;
 	const allowedFields = new Set([
+		"executionOwnership", "kernelOperationDirectory",
 		"executionLifetime", "effectiveExecutionLifetime", "modelResponseAliases", "version", "launchContractDigest", "sourceRunId", "agentContract", "agent", "sessionFile", "cwd", "model", "modelProvider", "modelOverrideFromParent", "modelOrigin", "fast", "thinking", "thinkingCeiling", "tools", "allowNestedSubagents", "allowedAgents", "extensions",
 		"subagentOnlyExtensions", "mcpDirectTools", "excludeTools", "mutationTools", "systemPrompt", "systemPromptMode", "inheritProjectContext", "inheritGlobalContext", "inheritSkills", "skills",
 		"skillPath", "agentFilePath", "memory", "outputPath", "outputMode", "structuredOutputSchema", "acceptance", "sessionDir", "artifactConfig",
@@ -332,6 +391,9 @@ export function readAsyncRecoveryDescriptor(asyncDir: string | undefined): Steer
 	for (const field of Object.keys(parsed)) {
 		if (!allowedFields.has(field)) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': unknown field '${field}'.`);
 	}
+	parseRecoveryOwnership(parsed.executionOwnership, descriptorPath);
+	parseRecoveryKernelDirectory(parsed.kernelOperationDirectory, descriptorPath);
+	if (parsed.kernelOperationDirectory !== undefined && parsed.executionOwnership === undefined) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': kernelOperationDirectory requires executionOwnership.`);
 	for (const field of ["executionLifetime", "effectiveExecutionLifetime"] as const) {
 		const lifetime = resolveExecutionLifetime(parsed[field]);
 		if (lifetime.error) throw new Error(`Invalid async recovery descriptor '${descriptorPath}': ${field}: ${lifetime.error}`);
@@ -482,6 +544,9 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 	const recoveryDescriptor = readAsyncRecoveryDescriptor(location.asyncDir ?? undefined);
 	const result = location.resultPath ? readResultFile(location.resultPath) : undefined;
 	const runId = status?.runId ?? result?.runId ?? result?.id ?? location.resolvedId ?? (location.asyncDir ? path.basename(location.asyncDir) : "unknown");
+	const recoveryOwnership = readAsyncRecoveryOwnership(location.asyncDir ?? undefined, runId, recoveryDescriptor, status, result);
+	const ownershipFields: Pick<AsyncResumeTarget, "recoveryOwnership"> = {};
+	if (recoveryOwnership) ownershipFields.recoveryOwnership = recoveryOwnership;
 	const mode = resumeTargetMode(status, result);
 	if (options.sessionId && ((status && status.sessionId !== options.sessionId) || (result && result.sessionId !== options.sessionId))) {
 		throw new Error(`Async run '${runId}' was not found in the active session.`);
@@ -523,6 +588,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 					...(capabilityCeiling ? { capabilityCeiling } : {}),
 					...(selectedStep.thinkingCeiling ? { thinkingCeiling: selectedStep.thinkingCeiling } : {}),
 					...(recoveryDescriptor ? { recoveryDescriptor } : {}),
+					...ownershipFields,
 				};
 			}
 			if (selectedStep?.status === "pending") throw new Error(`Async run '${runId}' child ${requestedIndex} is pending and has not started yet. Wait for it to run or complete before resuming.`);
@@ -555,6 +621,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 				...(capabilityCeiling ? { capabilityCeiling } : {}),
 				...(selected.step.thinkingCeiling ? { thinkingCeiling: selected.step.thinkingCeiling } : {}),
 				...(recoveryDescriptor ? { recoveryDescriptor } : {}),
+				...ownershipFields,
 			};
 		}
 	}
@@ -606,6 +673,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		...(capabilityCeiling ? { capabilityCeiling } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		...(recoveryDescriptor ? { recoveryDescriptor } : {}),
+		...ownershipFields,
 	};
 }
 

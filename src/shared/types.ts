@@ -2181,6 +2181,7 @@ export interface ForegroundResumeChild {
 	agentContract?: AgentContract;
 	/** Private bounded launch fields needed to preserve the child contract on resume. */
 	resumeContract?: {
+		executionOwnership?: ExecutionOwnership;
 		executionLifetime?: ExecutionLifetime;
 		modelResponseAliases?: Record<string, string[]>;
 		outputSchema?: JsonSchemaObject | false;
