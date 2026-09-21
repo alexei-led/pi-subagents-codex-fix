@@ -1888,6 +1888,7 @@ export interface ExternalProcessStatus {
 }
 
 export interface AsyncStatus {
+	terminationReason?: "execution_lifetime_expired";
 	lastToolFailure?: LastToolFailure;
 	ownedWorkflowKeys?: string[];
 	kernelOperationDirectory?: string;

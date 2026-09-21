@@ -764,7 +764,7 @@ async function observeOperation(operation: DurableOperation, options: RegisterSu
 	if (kernel?.processTerminalProof.state === "observed" && (kernel.mapping?.nativeOperation?.operationId !== intent.operationId || kernel.mapping.nativeOperation.digest !== intent.digest)) processTerminalProof = { version: 1, state: "unknown", runId: intent.runId, runnerProcessInstanceId: "unknown", reason: "Kernel mapping does not match the durable native operation." };
 	const workflowTerminalProof = status?.mode === "workflow" ? readWorkflowTerminalProof(asyncDir, intent.runId) : undefined;
 	const cancellationRequested = operation.cancelled();
-	const stopped = cancellationRequested || status?.stopped === true;
+	const stopped = cancellationRequested || kernel?.stopRequested === true || status?.stopped === true;
 	return {
 		...responseRecord,
 		operationId: intent.operationId,
@@ -780,7 +780,7 @@ async function observeOperation(operation: DurableOperation, options: RegisterSu
 		effectiveExecutionOwnership: intent.effectiveExecutionOwnership,
 		executionRoute: intent.executionRoute,
 		ownedWorkflowKeys: intent.ownedWorkflowKeys,
-		terminationReason: kernel?.observation.timedOut || (intent.effectiveExecutionLifetime?.mode === "bounded" && status?.timedOut) ? "execution_lifetime_expired" : undefined,
+		terminationReason: !stopped && (kernel?.observation.timedOut || (intent.effectiveExecutionLifetime?.mode === "bounded" && status?.timedOut)) ? "execution_lifetime_expired" : undefined,
 		processTerminalProof,
 		workflowTerminalProof,
 		status: kernel?.runnerFailed ? stopped ? "stopped" : "failed" : status?.state,

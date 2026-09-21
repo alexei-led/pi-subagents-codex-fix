@@ -120,6 +120,12 @@ Explicit cancellation, bounded lifetime expiry, or confirmed runner failure
 initiates cleanup inside the same owned operation. No replacement writer is
 authorized until retirement is proven.
 
+Verified retirement settles unfinished runner status even if the helper could not
+publish an exit receipt. The run and unfinished steps become failed; confirmed
+budget expiry records `execution_lifetime_expired`. Explicit cancellation retains
+stopped status and takes precedence over that classification. Completed output is
+preserved, and no exit code or signal is invented when its receipt is missing.
+
 Legacy `processTerminalProof` preserves runner close and process-group evidence.
 It is not inferred from the wrapper's terminal state. In-host workflows execute in the
 host process, so their separate `workflowTerminalProof` requires a durable closed

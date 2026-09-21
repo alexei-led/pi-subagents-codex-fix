@@ -9,6 +9,11 @@ import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { Type } from "typebox";
 import { Compile } from "typebox/compile";
+import { observeNativeKernelRun, writeNativeKernelMapping } from "../../src/runs/background/runtime-ownership.ts";
+import { DurableOperation } from "../../src/runs/background/durable-operation.ts";
+import { readStatus } from "../../src/shared/utils.ts";
+import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent } from "../../src/extension/rpc.ts";
+import { createEventBus, makeMinimalCtx } from "../support/helpers.ts";
 import {
   cancelKernelOwnedProcess,
   observeKernelOwnedProcess,
@@ -54,8 +59,9 @@ interface BoundaryState {
   retirementRecords?: ("exit" | "timeout")[];
 }
 
-function fixture(t: TestContext, lifetime: Lifetime = { kind: "unbounded" }) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "kernel-owned-boundary-"));
+function fixture(t: TestContext, lifetime: Lifetime = { kind: "unbounded" }, preparedDirectory?: string) {
+  const directory = preparedDirectory ?? fs.mkdtempSync(path.join(os.tmpdir(), "kernel-owned-boundary-"));
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   fs.chmodSync(directory, 0o700);
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const nativeExecutable = path.join(directory, "native.mjs");
@@ -132,6 +138,59 @@ function fixture(t: TestContext, lifetime: Lifetime = { kind: "unbounded" }) {
       });
   }
   return { directory, command, envelope, state, admission, save, admit, calls };
+}
+
+const terminalReplyValidator = Compile(Type.Object({ success: Type.Literal(true), data: Type.Object({ status: Type.String(), terminationReason: Type.Optional(Type.String()), processTerminalProof: Type.Object({ state: Type.String() }), statusPayload: Type.Optional(Type.Object({ state: Type.String(), terminationReason: Type.Optional(Type.String()) })) }) }));
+
+for (const outcome of ["bounded", "unfinished", "native-stop", "outer-stop", "complete", "unknown", "missing-status", "missing-status-stop"] as const) {
+  test(`native reconciliation settles verified retirement without an exit receipt (${outcome})`, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "native-retired-receipt-"));
+    t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+    const durable = new DurableOperation(root, root, "native-operation");
+    const bounded = outcome === "bounded" || outcome === "native-stop" || outcome === "outer-stop" || outcome === "missing-status-stop";
+    const missingStatus = outcome === "missing-status" || outcome === "missing-status-stop";
+    durable.claim({ digest: "native-digest", requestHash: "request-hash", effectiveExecutionOwnership: { mode: "kernel" }, effectiveExecutionLifetime: bounded ? { mode: "bounded", timeoutMs: 1 } : { mode: "unbounded" } });
+    const operation = fixture(t, bounded ? { kind: "bounded", timeoutMs: 1 } : { kind: "unbounded" }, path.join(durable.directory, "owned"));
+    operation.admit();
+    operation.state.coalition = { ok: false, errno: outcome === "unknown" ? 1 : 3, error: "retired" };
+    operation.save();
+    if (bounded) publishRecord(path.join(operation.directory, "timeout.json"), { ...binding(operation.envelope), observedAt: new Date().toISOString() });
+    const asyncDir = path.join(root, durable.runId);
+    fs.mkdirSync(asyncDir);
+    const completed = { agent: "completed", status: "complete", endedAt: 1, output: "preserved completed output" };
+    if (!missingStatus) fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: durable.runId, mode: "single", state: outcome === "complete" ? "complete" : outcome === "unfinished" ? "queued" : "running", startedAt: 1, steps: [completed, { agent: "unfinished", status: outcome === "complete" ? "complete" : "running" }] }));
+    writeNativeKernelMapping(operation.directory, { version: 1, runId: durable.runId, runnerProcessInstanceId: "runner-instance", asyncDir, kernelBinding: binding(operation.envelope) });
+    if (outcome === "native-stop" || outcome === "missing-status-stop") fs.writeFileSync(path.join(operation.directory, "native-stop.json"), JSON.stringify({ runId: durable.runId, requestedAt: Date.now() }));
+    if (outcome === "outer-stop") durable.cancel("native-digest");
+    assert.equal(fs.existsSync(path.join(operation.directory, "exit.json")), false);
+    const result = await observeNativeKernelRun(operation.directory, durable.runId);
+    assert.equal(result.processTerminalProof.state, outcome === "unknown" ? "unknown" : "observed");
+    assert.equal(result.runnerFailed, outcome !== "complete" && outcome !== "unknown");
+    const stopped = outcome === "native-stop" || outcome === "outer-stop" || outcome === "missing-status-stop";
+    const expectedState = stopped ? "stopped" : outcome === "complete" ? "complete" : outcome === "unknown" ? "running" : "failed";
+    const status = readStatus(asyncDir);
+    if (!missingStatus) {
+      assert.equal(status?.state, expectedState);
+      assert.deepEqual(status?.steps?.[0], completed);
+      assert.equal(status?.steps?.[1]?.status, expectedState);
+      assert.equal(status?.terminationReason, outcome === "bounded" ? "execution_lifetime_expired" : undefined);
+      if (bounded) assert.equal(status?.timedOut, true);
+    }
+    const events = createEventBus();
+    const rpc = registerSubagentRpcBridge({ events, operationDirRoot: root, asyncDirRoot: root, resultsDir: path.join(root, "results"), getContext: () => makeMinimalCtx(root), execute: async () => assert.fail("Observation cannot dispatch a replacement") });
+    t.after(() => rpc.dispose());
+    const reply = new Promise<ReturnType<typeof terminalReplyValidator.Parse>>((resolve, reject) => {
+      events.on(subagentRpcReplyEvent("terminal-lookup"), value => {
+        if (!terminalReplyValidator.Check(value)) reject(new Error(JSON.stringify(value)));
+        else resolve(value);
+      });
+    });
+    events.emit(SUBAGENT_RPC_REQUEST_EVENT, { version: 1, requestId: "terminal-lookup", method: "lookup", params: { operationId: "native-operation", digest: "native-digest" } });
+    const data = (await reply).data;
+    assert.equal(data.status, expectedState);
+    assert.equal(data.terminationReason, outcome === "bounded" ? "execution_lifetime_expired" : undefined);
+    if (!missingStatus) assert.equal(data.statusPayload?.state, expectedState);
+  });
 }
 
 test("cancellation creates a durable fence before an operation directory exists", async (t) => {

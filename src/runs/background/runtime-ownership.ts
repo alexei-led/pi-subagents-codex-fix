@@ -128,18 +128,21 @@ export function readNativeKernelMapping(operationDirectory: string, runId: strin
 	} catch { return undefined; }
 }
 
+function nativeStopRequestedFor(operationDirectory: string, runId: string): boolean {
+	try {
+		const stop: unknown = JSON.parse(fs.readFileSync(path.join(operationDirectory, "native-stop.json"), "utf8"));
+		return nativeStopValidator.Check(stop) && stop.runId === runId;
+	} catch { return false; }
+}
+
 export async function observeNativeKernelRun(operationDirectory: string, runId: string) {
 	const mapping = readNativeKernelMapping(operationDirectory, runId);
 	let observation = await observeKernelOwnedProcess(operationDirectory);
-	const status = mapping ? readStatus(mapping.asyncDir) : null;
+	let status = mapping ? readStatus(mapping.asyncDir) : null;
 	const bindingVerified = Boolean(mapping && observation.binding && sameBinding(mapping.kernelBinding, observation.binding));
-	let nativeStopRequested = false;
-	try {
-		const stop: unknown = JSON.parse(fs.readFileSync(path.join(operationDirectory, "native-stop.json"), "utf8"));
-		nativeStopRequested = nativeStopValidator.Check(stop) && stop.runId === runId;
-	} catch {}
+	let nativeStopRequested = nativeStopRequestedFor(operationDirectory, runId);
 	const outerStopRequested = fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json"));
-	const runnerFailed = Boolean(observation.signal) || (observation.exitCode !== undefined && observation.exitCode !== null && observation.exitCode !== 0)
+	let runnerFailed = Boolean(observation.signal) || (observation.exitCode !== undefined && observation.exitCode !== null && observation.exitCode !== 0)
 		|| (observation.exitCode === 0 && (!status || status.state === "running" || status.state === "queued"));
 	if (bindingVerified && (runnerFailed || outerStopRequested || nativeStopRequested || status?.stopped === true) && (observation.status === "active" || observation.status === "pending")) observation = await cancelKernelOwnedProcess(operationDirectory, { deadlineMs: 1_000 });
 	else if (mapping && bindingVerified && observation.exitCode === undefined && (observation.status === "pending" || observation.status === "active")) {
@@ -171,18 +174,27 @@ export async function observeNativeKernelRun(operationDirectory: string, runId: 
 		proof = { version: 1, state: "pending", runId, runnerProcessInstanceId: mapping.runnerProcessInstanceId, reason: "Owned runner or descendants remain active." };
 	}
 	if (proof.state === "observed" && mapping) {
+		status = readStatus(mapping.asyncDir);
+		nativeStopRequested = nativeStopRequestedFor(operationDirectory, runId);
+		runnerFailed = Boolean(observation.signal) || observation.timedOut === true || (observation.exitCode !== undefined && observation.exitCode !== null && observation.exitCode !== 0)
+			|| !status || status.state === "running" || status.state === "queued";
 		writePrivateAtomicJson(path.join(mapping.asyncDir, "process-terminal.json"), proof);
 		if (status) {
 			const stopRequested = nativeStopRequested || status.stopped === true || fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json"));
+			const failure = observation.timedOut ? "Execution lifetime expired before the owned run completed." : "Owned runner retired without a successful terminal result.";
+			const now = Date.now();
 			writePrivateAtomicJson(path.join(mapping.asyncDir, "status.json"), {
 				...status, processTerminal: proof,
 				state: stopRequested ? "stopped" : runnerFailed ? "failed" : status.state,
 				stopped: stopRequested || status.stopped,
-				steps: stopRequested ? status.steps?.map((step) => step.status === "running" || step.status === "pending" ? { ...step, status: "stopped", stopped: true, endedAt: Date.now() } : step) : status.steps,
-				endedAt: status.endedAt ?? Date.now(),
-				lastUpdate: Date.now(),
+				error: !stopRequested && runnerFailed ? status.error ?? failure : status.error,
+				timedOut: observation.timedOut || status.timedOut,
+				terminationReason: stopRequested ? undefined : observation.timedOut ? "execution_lifetime_expired" : status.terminationReason,
+				steps: stopRequested || runnerFailed ? status.steps?.map((step) => step.status === "running" || step.status === "pending" ? { ...step, status: stopRequested ? "stopped" : "failed", stopped: stopRequested || step.stopped, timedOut: observation.timedOut || step.timedOut, error: stopRequested ? step.error : step.error ?? failure, endedAt: step.endedAt ?? now } : step) : status.steps,
+				endedAt: status.endedAt ?? now,
+				lastUpdate: now,
 			});
 		}
 	}
-	return { mapping, observation, processTerminalProof: proof, neverStarted, runnerFailed, bindingVerified };
+	return { mapping, observation, processTerminalProof: proof, neverStarted, runnerFailed, bindingVerified, stopRequested: nativeStopRequested || status?.stopped === true || fs.existsSync(path.join(path.dirname(operationDirectory), "cancel.json")) };
 }
