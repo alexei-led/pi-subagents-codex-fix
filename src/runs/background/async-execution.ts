@@ -2294,6 +2294,8 @@ export function executeAsyncSingle(
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
 				mode: "single",
 				state: "running",
+				effectiveExecutionLifetime,
+				...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
 				startedAt: initialStatusAt,
 				lastUpdate: initialStatusAt,
 				currentStep: 0,

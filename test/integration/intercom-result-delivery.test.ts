@@ -31,6 +31,9 @@ interface ExecutorResult {
 		runId?: string;
 		results?: Array<{ agent?: string; finalOutput?: string; sessionFile?: string; acceptance?: { status?: string }; artifactPaths?: { metadataPath?: string } }>;
 		asyncId?: string;
+		effectiveExecutionLifetime?: { mode: string; timeoutMs?: number };
+		timeoutMs?: number;
+		deadlineAt?: number;
 		workflow?: { value?: unknown };
 	};
 }
@@ -202,7 +205,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 		}, null, 2), "utf-8");
 	}
 
-	function makeExecutor(options: { bridgeMode?: "always" | "off"; resultDelivery?: boolean; agents?: ReturnType<typeof makeAgent>[]; acknowledgeResults?: boolean; kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean; maxActiveAsyncRunsPerSession?: number } = {}) {
+	function makeExecutor(options: { bridgeMode?: "always" | "off"; resultDelivery?: boolean; agents?: ReturnType<typeof makeAgent>[]; acknowledgeResults?: boolean; kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean; maxActiveAsyncRunsPerSession?: number; timeoutMs?: number } = {}) {
 		const events = createRecordingEventBus({ acknowledgeResults: options.acknowledgeResults ?? true });
 		const state = {
 			baseCwd: tempDir,
@@ -230,6 +233,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			},
 			state,
 			config: {
+				...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
 				intercomBridge: {
 					mode: options.bridgeMode ?? "always",
 					...(options.resultDelivery === undefined ? {} : { resultDelivery: options.resultDelivery }),
@@ -570,14 +574,22 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			}, null, 2), "utf-8");
 			const { executor } = makeExecutor({ agents: [makeAgent("gpt-pro", { runner: { type: "external-job", provider: "surf-oracle", options: { tier: "pro" } } })] });
 
-			const first = await executor.execute("resume-external-job-first", { action: "resume", id: sourceRunId, message: followUpMessage }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			const first = await executor.execute("resume-external-job-first", { action: "resume", id: sourceRunId, message: followUpMessage, executionLifetime: { mode: "bounded", timeoutMs: 60_000 } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			assert.equal(first.isError, undefined, first.content[0]?.text ?? "follow-up failed");
 			assert.equal(first.details?.asyncId, expectedRunId);
+			assert.deepEqual(first.details?.effectiveExecutionLifetime, { mode: "bounded", timeoutMs: 60_000 });
 
 			const duplicate = await executor.execute("resume-external-job-duplicate", { action: "resume", id: sourceRunId, message: followUpMessage }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
 			assert.equal(duplicate.isError, undefined, duplicate.content[0]?.text ?? "duplicate failed");
 			assert.equal(duplicate.details?.asyncId, expectedRunId);
 			assert.match(duplicate.content[0]?.text ?? "", /already exists/);
+			assert.deepEqual(duplicate.details?.effectiveExecutionLifetime, first.details?.effectiveExecutionLifetime);
+			const conflicting = await executor.execute("resume-external-job-conflicting", { action: "resume", id: sourceRunId, message: followUpMessage, executionLifetime: { mode: "unbounded" } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(conflicting.isError, true);
+			assert.match(conflicting.content[0]?.text ?? "", /different execution contract/);
+			const malformed = await executor.execute("resume-external-job-malformed", { action: "resume", id: sourceRunId, message: followUpMessage, executionLifetime: { mode: "bounded", timeoutMs: 0 } }, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(malformed.isError, true);
+			assert.match(malformed.content[0]?.text ?? "", /executionLifetime/);
 
 			const resultPath = path.join(RESULTS_DIR, `${expectedRunId}.json`);
 			const deadline = Date.now() + 10_000;
@@ -602,6 +614,85 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			fs.rmSync(path.join(RESULTS_DIR, `${expectedRunId}.json`), { force: true });
 		}
 	});
+
+	for (const scenario of [
+		{ name: "omitted lifetime keeps the legacy unbounded follow-up", params: {}, expected: { mode: "unbounded" }, expires: false },
+		{ name: "explicit unbounded overrides agent and configuration deadlines", params: { executionLifetime: { mode: "unbounded" } }, expected: { mode: "unbounded" }, expires: false },
+		{ name: "explicit bounded lifetime expires the actual follow-up runner", params: { executionLifetime: { mode: "bounded", timeoutMs: 1000 } }, expected: { mode: "bounded", timeoutMs: 1000 }, expires: true },
+		{ name: "explicit maxRuntimeMs alias reaches the follow-up runner", params: { maxRuntimeMs: 1000 }, expected: { mode: "bounded", timeoutMs: 1000 }, expires: true },
+	]) {
+		it(scenario.name, async () => {
+			const sourceRunId = `follow-up-lifetime-${Date.now()}`;
+			const sourceAsyncDir = path.join(ASYNC_DIR, sourceRunId);
+			const parentProviderJobId = `parent-${sourceRunId}`;
+			const followUpMessage = scenario.name;
+			const requestDigest = externalJobFollowUpRequestDigest({ provider: "lifetime-provider", parentProviderJobId, promptDigest: externalJobPromptDigest(followUpMessage), options: {} });
+			const runId = externalJobFollowUpRunId(requestDigest);
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			const resultPath = path.join(RESULTS_DIR, `${runId}.json`);
+			let allowCompletion = false;
+			let followUps = 0;
+			registerExternalJobProvider({
+				name: "lifetime-provider",
+				start: () => { throw new Error("follow-up must not restart the provider job"); },
+				followUp: () => { followUps++; return { providerJobId: "child", state: "running" }; },
+				status: (providerJobId) => ({ providerJobId, state: allowCompletion ? "completed" : "running" }),
+				reattach: (providerJobId) => ({ providerJobId, state: allowCompletion ? "completed" : "running" }),
+				result: (providerJobId) => ({ providerJobId, state: "completed", output: "finished follow-up" }),
+			});
+			fs.mkdirSync(sourceAsyncDir, { recursive: true });
+			fs.writeFileSync(path.join(sourceAsyncDir, "status.json"), JSON.stringify({
+				runId: sourceRunId, sessionId: "session-123", mode: "single", state: "complete", startedAt: 100, lastUpdate: 200, cwd: tempDir,
+				steps: [{ agent: "external", status: "complete", runner: { type: "external-job", provider: "lifetime-provider", options: {} }, externalJob: { provider: "lifetime-provider", providerJobId: parentProviderJobId, promptDigest: externalJobPromptDigest("original"), options: {}, state: "completed" } }],
+			}));
+			const { executor } = makeExecutor({ timeoutMs: 5, agents: [makeAgent("external", { defaultTimeoutMs: 5, runner: { type: "external-job", provider: "lifetime-provider", options: {} } })] });
+			const execute = (params: Record<string, unknown>) => executor.execute("follow-up-lifetime", params, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			async function drain(predicate: () => boolean, timeoutMs = 15_000): Promise<void> {
+				const end = Date.now() + timeoutMs;
+				while (!predicate() && Date.now() < end) {
+					serviceExternalJobBridgeRequests(asyncDir);
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
+				assert.ok(predicate(), `Follow-up did not reach expected state: ${fs.existsSync(path.join(asyncDir, "status.json")) ? fs.readFileSync(path.join(asyncDir, "status.json"), "utf8") : "no status"}`);
+			}
+			try {
+				for (const params of [
+					{ executionLifetime: null }, { executionLifetime: { mode: "bounded", timeoutMs: 0 } },
+					{ executionLifetime: { mode: "unbounded", timeoutMs: 100 } }, { executionLifetime: { mode: "other" } },
+					{ timeoutMs: 100, maxRuntimeMs: 200 }, { executionOwnership: { mode: "kernel" } },
+				]) {
+					const rejected = await execute({ action: "resume", id: sourceRunId, message: followUpMessage, ...params });
+					assert.equal(rejected.isError, true, JSON.stringify(params));
+					assert.equal(fs.existsSync(asyncDir), false);
+				}
+				const started = await execute({ action: "resume", id: sourceRunId, message: followUpMessage, ...scenario.params });
+				assert.equal(started.isError, undefined, JSON.stringify(started.content));
+				assert.deepEqual(started.details?.effectiveExecutionLifetime, scenario.expected);
+				if (!scenario.expires) {
+					await drain(() => followUps === 1);
+					await new Promise((resolve) => setTimeout(resolve, 50));
+					assert.equal(fs.existsSync(resultPath), false);
+					assert.equal(started.details?.deadlineAt, undefined);
+					allowCompletion = true;
+				}
+				await drain(() => fs.existsSync(resultPath));
+				const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf8"));
+				assert.deepEqual(status.effectiveExecutionLifetime, scenario.expected);
+				assert.equal(status.state, scenario.expires ? "failed" : "complete");
+				assert.equal(status.timedOut === true, scenario.expires);
+				assert.equal(typeof status.deadlineAt === "number", scenario.expires);
+			} finally {
+				allowCompletion = true;
+				if (fs.existsSync(asyncDir) && !fs.existsSync(resultPath)) {
+					await execute({ action: "stop", id: runId });
+					await drain(() => fs.existsSync(resultPath));
+				}
+				fs.rmSync(sourceAsyncDir, { recursive: true, force: true });
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+				fs.rmSync(resultPath, { force: true });
+			}
+		});
+	}
 
 	it("resume action starts an indexed external-job follow-up from multi-child async runs", async () => {
 		const sourceRunId = `resume-external-job-multi-${Date.now()}`;

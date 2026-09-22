@@ -1658,14 +1658,14 @@ function providerFollowUpSupport(providerName: string): { ok: true } | { ok: fal
 	}
 }
 
-function externalJobFollowUpStarted(input: { sourceRunId: string; runId: string; asyncDir: string; duplicate?: boolean; interactive: boolean }): AgentToolResult<Details> {
+function externalJobFollowUpStarted(input: { sourceRunId: string; runId: string; asyncDir: string; duplicate?: boolean; interactive: boolean; contract: Pick<Details, "effectiveExecutionLifetime" | "timeoutMs" | "deadlineAt" | "effectiveExecutionOwnership"> }): AgentToolResult<Details> {
 	const lines = [
 		input.duplicate ? `External-job follow-up already exists for ${input.sourceRunId}.` : `Started external-job follow-up for ${input.sourceRunId}.`,
 		`Follow-up run: ${input.runId}`,
 		`Async dir: ${input.asyncDir}`,
 		`Status if needed: subagent({ action: "status", id: "${input.runId}" })`,
 	];
-	return { content: [{ type: "text", text: formatAsyncStartedMessage(lines.join("\n"), input.interactive) }], details: { mode: "single", results: [], asyncId: input.runId, asyncDir: input.asyncDir } };
+	return { content: [{ type: "text", text: formatAsyncStartedMessage(lines.join("\n"), input.interactive) }], details: { mode: "single", results: [], asyncId: input.runId, asyncDir: input.asyncDir, ...input.contract } };
 }
 
 function externalRunnerControlError(asyncDir: string, action: "steer" | "resume"): AgentToolResult<Details> | undefined {
@@ -1683,6 +1683,10 @@ function externalRunnerControlError(asyncDir: string, action: "steer" | "resume"
 }
 
 async function resumeExternalJobFollowUp(input: {
+	executionLifetime?: ExecutionLifetime;
+	timeoutMs?: number;
+	requestedLifetime: boolean;
+	effectiveExecutionLifetime: ExecutionLifetime;
 	executionOwnership?: ExecutionOwnership;
 	kernelOperationDirectory?: string;
 	target: AsyncResumeSourceTarget;
@@ -1720,7 +1724,15 @@ async function resumeExternalJobFollowUp(input: {
 	const currentSessionId = input.deps.state.currentSessionId;
 	if (!currentSessionId) return { content: [{ type: "text", text: "External-job follow-up requires an active parent session." }], isError: true, details: { mode: "management", results: [] } };
 	if (fs.existsSync(asyncDir) || fs.existsSync(resultFilePath(DIRS.results, runId))) {
-		return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId, asyncDir, duplicate: true, interactive: input.ctx.hasUI });
+		const status = readStatus(asyncDir);
+		const savedLifetime = status?.effectiveExecutionLifetime;
+		const verifiedLifetime = resolveExecutionLifetime(savedLifetime);
+		if (!savedLifetime || verifiedLifetime.error) return { content: [{ type: "text", text: "The existing external-job follow-up execution contract is unavailable. Refusing to redispatch or assume its lifetime." }], isError: true, details: { mode: "management", results: [] } };
+		if ((input.requestedLifetime && externalJobStableJson(verifiedLifetime.effectiveExecutionLifetime) !== externalJobStableJson(input.effectiveExecutionLifetime))
+			|| (input.executionLifetime?.mode !== "unbounded" && input.absoluteDeadlineAt !== undefined && status?.deadlineAt !== input.absoluteDeadlineAt)) {
+			return { content: [{ type: "text", text: "The existing external-job follow-up has a different execution contract. Its lifetime cannot be changed by replaying the same follow-up." }], isError: true, details: { mode: "management", results: [] } };
+		}
+		return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId, asyncDir, duplicate: true, interactive: input.ctx.hasUI, contract: { effectiveExecutionLifetime: verifiedLifetime.effectiveExecutionLifetime, timeoutMs: status?.timeoutMs, deadlineAt: status?.deadlineAt } });
 	}
 
 	const depthState = checkSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime);
@@ -1750,6 +1762,8 @@ async function resumeExternalJobFollowUp(input: {
 		runner: { type: "external-job", provider: runner.provider, options: runner.options },
 	};
 	const result = await executeAsyncSingle(runId, compactOptional<Parameters<typeof executeAsyncSingle>[1]>({
+		executionLifetime: input.executionLifetime,
+		timeoutMs: input.timeoutMs,
 		executionOwnership: input.executionOwnership,
 		kernelOperationDirectory: input.kernelOperationDirectory,
 		agent: input.target.agent,
@@ -1798,7 +1812,7 @@ async function resumeExternalJobFollowUp(input: {
 		activeAsyncCapacity?.rollback();
 		return result;
 	}
-	return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId: result.details.asyncId ?? runId, asyncDir: result.details.asyncDir ?? asyncDir, interactive: input.ctx.hasUI });
+	return externalJobFollowUpStarted({ sourceRunId: input.target.runId, runId: result.details.asyncId ?? runId, asyncDir: result.details.asyncDir ?? asyncDir, interactive: input.ctx.hasUI, contract: result.details });
 }
 
 function resolveRequestedResumeTarget(params: SubagentParamsLike, deps: ExecutorDeps, parentSessionFile: string | null): ResumeSourceTarget | { kind: "live-nested"; target: ResolvedSubagentRunId & { kind: "nested" } } {
@@ -1951,7 +1965,17 @@ async function resumeAsyncRun(input: {
 	if (executionOwnership?.mode === "kernel" && (baseAgentConfig.machine || baseAgentConfig.runner?.type === "external-job" || (target.source === "async" && target.runner?.type === "external-job"))) return buildRequestedModeError(input.params, "Kernel ownership does not support remote or external-job recovery.");
 	if (target.source === "async" && target.runner?.type === "external-job") {
 		if (attachChain) return { content: [{ type: "text", text: "External-job follow-up does not support chain attachment. Use action='resume' with message instead." }], isError: true, details: { mode: "management", results: [] } };
+		const timeout = resolveForegroundTimeout(input.params);
+		if (timeout.error) return buildRequestedModeError(input.params, timeout.error);
+		const lifetime = resolveExecutionLifetime(input.params.executionLifetime, timeout.timeoutMs);
+		if (lifetime.error) return buildRequestedModeError(input.params, lifetime.error);
 		return resumeExternalJobFollowUp({
+			executionLifetime: input.params.executionLifetime,
+			timeoutMs: timeout.timeoutMs,
+			requestedLifetime: input.params.executionLifetime !== undefined || input.params.timeoutMs !== undefined || input.params.maxRuntimeMs !== undefined,
+			effectiveExecutionLifetime: lifetime.effectiveExecutionLifetime!,
+			executionOwnership,
+			kernelOperationDirectory,
 			target,
 			followUp,
 			baseAgentConfig,
