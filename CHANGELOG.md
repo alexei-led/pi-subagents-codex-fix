@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Launches can now set `executionLifetime` to an explicit bounded timeout or to `unbounded`. The lifetime is preserved across foreground, async, workflow-child, nested-child, and recovery paths. Omitted lifetimes keep the existing defaults. Thanks to [@alexei-led](https://github.com/alexei-led) for [#2435](https://github.com/nicobailon/pi-subagents/issues/2435) and [#2443](https://github.com/nicobailon/pi-subagents/pull/2443).
+
 ## [0.71.0] - 2026-09-23
 
 ### Highlights
