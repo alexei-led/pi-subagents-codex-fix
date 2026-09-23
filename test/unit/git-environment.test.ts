@@ -31,4 +31,8 @@ describe("omitGitRoutingEnv", () => {
 	it("removes every indexed Git config entry", () => {
 		assert.deepEqual(omitGitRoutingEnv({ GIT_CONFIG_KEY_17: "user.name", GIT_CONFIG_VALUE_17: "Test", KEEP_ME: "yes" }), { KEEP_ME: "yes" });
 	});
+
+	it("matches names case-insensitively, as Windows and Git for Windows do", () => {
+		assert.deepEqual(omitGitRoutingEnv({ git_dir: "/repo/.git", Git_Work_Tree: "/repo", git_config_key_0: "core.bare", KEEP_ME: "yes" }), { KEEP_ME: "yes" });
+	});
 });
