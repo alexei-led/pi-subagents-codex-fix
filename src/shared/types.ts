@@ -710,6 +710,25 @@ export type ProcessTerminal =
 		instances?: RunnerProcessInstanceExit[];
 	});
 
+export type WorkflowTerminalProof =
+	| {
+		version: 1;
+		kind: "workflow";
+		runId: string;
+		state: "observed";
+		dispatchClosed: true;
+		observedAt: number;
+		children: ProcessTerminal[];
+	}
+	| {
+		version: 1;
+		kind: "workflow";
+		runId: string;
+		state: "pending" | "unknown";
+		dispatchClosed: boolean;
+		reason: string;
+	};
+
 /** Identifies the durable schedule that launched a run, so its completion is attributable. */
 export interface ScheduleOrigin {
 	id: string;
@@ -1415,6 +1434,7 @@ export interface Details {
 	context?: "fresh" | "fork" | "mixed";
 	results: SingleResult[];
 	workflowChildren?: WorkflowChildSummary;
+	workflowTerminalProof?: WorkflowTerminalProof;
 	/**
 	 * Terminal completion payloads for runs this bg_wait call observed
 	 * finishing. Async completions travel as result files that are consumed and
