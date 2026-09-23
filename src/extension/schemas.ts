@@ -3,6 +3,7 @@
  */
 
 import { Type } from "typebox";
+import { MAX_EXECUTION_TIMEOUT_MS } from "../runs/shared/execution-lifetime.ts";
 
 function keepTopLevelParameterDescriptions<T>(schema: T): T {
 	return pruneNestedDescriptions(schema, []) as T;
@@ -360,7 +361,7 @@ const SubagentParamProperties = {
 	async: Type.Optional(Type.Boolean({ description: "Background; default asyncByDefault. false only to block parent." })),
 	executionLifetime: Type.Optional(Type.Union([
 		Type.Object({ mode: Type.String({ enum: ["unbounded"] }) }, { additionalProperties: false }),
-		Type.Object({ mode: Type.String({ enum: ["bounded"] }), timeoutMs: Type.Integer({ minimum: 1, maximum: 2_147_483_647 }) }, { additionalProperties: false }),
+		Type.Object({ mode: Type.String({ enum: ["bounded"] }), timeoutMs: Type.Integer({ minimum: 1, maximum: MAX_EXECUTION_TIMEOUT_MS }) }, { additionalProperties: false }),
 	], { description: "Unbounded disables run deadlines; bounded requires timeoutMs. Omission keeps timeout defaults." })),
 	timeoutMs: Type.Optional(Type.Integer({ minimum: 1, description: "Timeout. Foreground and single async runs use config timeoutMs, else 30m; async composites have no default parent deadline. Alias maxRuntimeMs." })),
 	maxRuntimeMs: Type.Optional(Type.Integer({ minimum: 1, description: "Alias timeoutMs (same defaults)." })),

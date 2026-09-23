@@ -94,12 +94,20 @@ describe("public subagent delegation contract", () => {
 			[{ ...request, skill: Array.from({ length: 256 }, () => "x".repeat(257)) }, /skill entries exceed 64 KiB in aggregate/],
 			[{ ...request, result: { kind: "structured", schema: { value: "x".repeat(65_536) } } }, /result.schema exceeds 64 KiB/],
 			[{ ...request, timeoutMs: 2_147_483_648 }, /timeoutMs must be <= 2147483647/],
+			[{ ...request, executionLifetime: { mode: "unbounded" } }, /executionLifetime cannot be combined with timeoutMs/],
 		] as const;
 		for (const [input, expected] of malformed) {
 			const parsed = parseSubagentDelegationRequest(input);
 			assert.equal(parsed.ok, false);
 			if (!parsed.ok) assert.match(parsed.error, expected);
 		}
+	});
+
+	it("accepts and forwards one explicit execution lifetime", () => {
+		const executionLifetime = { mode: "unbounded" as const };
+		const parsed = parseSubagentDelegationRequest({ ...request, timeoutMs: undefined, executionLifetime });
+		assert.equal(parsed.ok, true);
+		if (parsed.ok) assert.deepEqual(toSubagentDelegationExecutionParams(parsed.request).executionLifetime, executionLifetime);
 	});
 
 	it("accepts exact zero tool budgets for structured delegated leaves", () => {

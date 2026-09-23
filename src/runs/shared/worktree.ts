@@ -777,7 +777,7 @@ function linkNodeModulesIfPresent(toplevel: string, worktreePath: string): boole
 }
 
 export function worktreeSetupHookTimeoutForLifetime(configuredTimeoutMs: number | undefined, executionLifetime?: ExecutionLifetime): number | false | undefined {
-	return configuredTimeoutMs ?? (executionLifetime?.mode === "unbounded" ? false : undefined);
+	return executionLifetime?.mode === "unbounded" ? false : configuredTimeoutMs;
 }
 
 export function resolveWorktreeSetupHookTimeout(timeoutMs: number | false | undefined): number | undefined {

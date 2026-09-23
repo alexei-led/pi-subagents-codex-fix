@@ -1513,6 +1513,7 @@ describe("async run status inspection", () => {
 			}));
 			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
 				runId: "workflow-parent", mode: "workflow", state: "complete", startedAt: 100, lastUpdate: 200, endedAt: 250,
+				effectiveExecutionLifetime: { mode: "bounded", timeoutMs: 60_000 },
 				steps: [{ agent: "worker", workflowKey: "main", runId: "child-run", async: true, status: "completed" }],
 				workflowChildren: {
 					version: 1, parentToolCallId: "tool-call", workflowRunId: "workflow-parent", inventoryComplete: true,
@@ -1525,6 +1526,7 @@ describe("async run status inspection", () => {
 				version: 1, kind: "workflow", runId: "workflow-parent", state: "observed", dispatchClosed: true,
 				observedAt: 300, children: [childProof],
 			});
+			assert.deepEqual(result.details.effectiveExecutionLifetime, { mode: "bounded", timeoutMs: 60_000 });
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

@@ -1804,6 +1804,20 @@ syncBuiltinESMExports();
 		await readAsyncPayload(result.details.asyncId);
 		const revivedStatus = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, result.details.asyncId, "status.json"), "utf-8"));
 		assert.deepEqual(revivedStatus.effectiveExecutionLifetime, { mode: "bounded", timeoutMs: 60_000 });
+
+		mockPi.onCall({ output: "Revived with an override" });
+		const overridden = await makeAsyncExecutor([makeAgent("worker")]).execute(
+			"revive-lifetime-override",
+			{ action: "resume", id: sourceId, message: "Continue briefly", maxRuntimeMs: 1_000 },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+		assert.ok(!overridden.isError, overridden.content[0]?.text);
+		assert.ok(overridden.details.asyncId);
+		await readAsyncPayload(overridden.details.asyncId);
+		const overriddenStatus = JSON.parse(fs.readFileSync(path.join(ASYNC_DIR, overridden.details.asyncId, "status.json"), "utf-8"));
+		assert.deepEqual(overriddenStatus.effectiveExecutionLifetime, { mode: "bounded", timeoutMs: 1_000 });
 	});
 
 	it("revives an inherited parent model outside the current registry", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {

@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { describe, it } from "node:test";
 import { prepareWorkflowLaunchParams } from "../../src/runs/foreground/subagent-executor.ts";
+import { DIRS } from "../../src/shared/types.ts";
 import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
 import { installSingleExecutionHooks, makeExecutor, mockPi, tempDir } from "../support/single-execution-fixture.ts";
 
@@ -22,6 +25,32 @@ describe("execution lifetime at the executor boundary", () => {
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /executionLifetime/);
 		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("rejects executionLifetime with either legacy timeout alias", async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		for (const legacy of [{ timeoutMs: 1_000 }, { maxRuntimeMs: 1_000 }]) {
+			const result = await executor.executePublic("mixed-lifetime", {
+				agent: "echo", task: "continue", async: false, executionLifetime: { mode: "unbounded" }, ...legacy,
+			}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /executionLifetime.*timeoutMs.*maxRuntimeMs/);
+		}
+		assert.equal(mockPi.callCount(), 0);
+	});
+
+	it("persists the defaulted foreground lifetime for recovery", async () => {
+		mockPi.onCall({ output: "completed" });
+		const result = await makeExecutor([makeAgent("echo")]).executePublic("remember-lifetime", {
+			agent: "echo", task: "continue", async: false, context: "fresh", acceptance: false, mission: false,
+		}, new AbortController().signal, undefined, makeMinimalCtx(tempDir));
+		assert.equal(result.isError, undefined);
+		assert.ok(result.details.runId);
+		const history = JSON.parse(fs.readFileSync(path.join(DIRS.results, "foreground-history.json"), "utf-8")) as {
+			runs: Array<{ runId: string; children: Array<{ resumeContract?: { executionLifetime?: unknown } }> }>;
+		};
+		const stored = history.runs.find((run) => run.runId === result.details.runId);
+		assert.deepEqual(stored?.children[0]?.resumeContract?.executionLifetime, { mode: "bounded", timeoutMs: HALF_HOUR });
 	});
 
 	it("keeps an explicitly unbounded foreground child alive beyond thirty minutes", async (t) => {

@@ -1,4 +1,4 @@
-import { resolveExecutionLifetime } from "../runs/shared/execution-lifetime.ts";
+import { MAX_EXECUTION_TIMEOUT_MS, resolveExecutionLifetime } from "../runs/shared/execution-lifetime.ts";
 import {
 	type SubagentDelegationRequest,
 } from "../api/delegation.ts";
@@ -81,9 +81,10 @@ export function parseSubagentDelegationRequest(data: unknown): SubagentDelegatio
 	}
 	const lifetime = resolveExecutionLifetime(value.executionLifetime);
 	if (lifetime.error) return { ok: false, ...identity, error: lifetime.error };
+	if (value.executionLifetime !== undefined && value.timeoutMs !== undefined) return { ok: false, ...identity, error: "executionLifetime cannot be combined with timeoutMs." };
 	const timeoutMs = typeof value.timeoutMs === "number" ? value.timeoutMs : undefined;
-	if (timeoutMs !== undefined && timeoutMs > 2_147_483_647) {
-		return { ok: false, ...identity, error: "timeoutMs must be <= 2147483647." };
+	if (timeoutMs !== undefined && timeoutMs > MAX_EXECUTION_TIMEOUT_MS) {
+		return { ok: false, ...identity, error: `timeoutMs must be <= ${MAX_EXECUTION_TIMEOUT_MS}.` };
 	}
 	if (value.toolBudget && typeof value.toolBudget === "object" && !Array.isArray(value.toolBudget)) {
 		const unsupportedToolBudgetField = Object.keys(value.toolBudget).find((key) => key !== "soft" && key !== "hard" && key !== "block");

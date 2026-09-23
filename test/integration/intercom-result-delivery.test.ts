@@ -898,6 +898,7 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 				{
 					action: "resume",
 					id: sourceRunId,
+					executionLifetime: { mode: "unbounded" },
 					chain: [{ agent: "reviewer", task: "Review this root result: {previous}" }],
 				},
 				new AbortController().signal,
@@ -919,8 +920,9 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 			assert.match(result.details?.asyncDir ?? "", new RegExp(`${attachedId}$`));
 			const statusPath = path.join(result.details!.asyncDir!, "status.json");
 			await waitForFile(statusPath);
-			const attachedStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { mode?: string; chainStepCount?: number; steps?: Array<{ agent?: string; label?: string; status?: string }> };
+			const attachedStatus = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as { mode?: string; chainStepCount?: number; effectiveExecutionLifetime?: unknown; steps?: Array<{ agent?: string; label?: string; status?: string }> };
 			assert.equal(attachedStatus.mode, "chain");
+			assert.deepEqual(attachedStatus.effectiveExecutionLifetime, { mode: "unbounded" });
 			assert.equal(attachedStatus.chainStepCount, 2);
 			assert.deepEqual(attachedStatus.steps?.map((step) => step.agent), ["worker", "reviewer"]);
 			assert.match(attachedStatus.steps?.[0]?.label ?? "", /Attached resume-chain-root-/);

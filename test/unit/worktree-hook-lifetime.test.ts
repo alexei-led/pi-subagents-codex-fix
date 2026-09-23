@@ -4,7 +4,7 @@ import { resolveWorktreeSetupHookTimeout, worktreeSetupHookTimeoutForLifetime } 
 
 it("removes only the implicit worktree hook deadline in unbounded mode", () => {
 	assert.equal(worktreeSetupHookTimeoutForLifetime(undefined, { mode: "unbounded" }), false);
-	assert.equal(worktreeSetupHookTimeoutForLifetime(1_000, { mode: "unbounded" }), 1_000);
+	assert.equal(worktreeSetupHookTimeoutForLifetime(1_000, { mode: "unbounded" }), false);
 	assert.equal(worktreeSetupHookTimeoutForLifetime(undefined, { mode: "bounded", timeoutMs: 2_000 }), undefined);
 	assert.equal(resolveWorktreeSetupHookTimeout(false), undefined);
 	assert.equal(resolveWorktreeSetupHookTimeout(undefined), 30_000);

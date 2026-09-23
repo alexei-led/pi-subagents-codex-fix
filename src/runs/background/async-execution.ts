@@ -1009,7 +1009,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, s.toolBudget ? "toolBudget" : a.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 		if (resolvedToolBudget.error) throw new AsyncStartValidationError(resolvedToolBudget.error);
 		const resolvedToolTimeout = resolveToolTimeoutMs({
-			executionLifetime: s.executionLifetime ?? params.executionLifetime,
+			executionLifetime: params.executionLifetime,
 			callValue: params.callToolTimeoutMs,
 			agentValue: a.defaultToolTimeoutMs,
 			configValue: params.configToolTimeoutMs,
@@ -1539,6 +1539,8 @@ export function executeAsyncChain(
 				state: "running",
 				startedAt: initialStatusAt,
 				lastUpdate: initialStatusAt,
+				effectiveExecutionLifetime,
+				...(lifetime.timeoutMs !== undefined ? { timeoutMs: lifetime.timeoutMs, deadlineAt } : {}),
 				currentStep: 0,
 				chainStepCount: eventChain.length,
 				...(initialParallelGroups.length ? { parallelGroups: initialParallelGroups } : {}),

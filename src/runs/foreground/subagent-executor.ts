@@ -65,7 +65,7 @@ import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightS
 import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { retainLiveForegroundNestedRoute } from "../../integrations/pi-web-session-liveness.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
-import { resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
+import { MAX_EXECUTION_TIMEOUT_MS, resolveExecutionLifetime } from "../shared/execution-lifetime.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { isAgentContract } from "../shared/agent-contract.ts";
@@ -763,7 +763,7 @@ function foregroundChildActivityFromProgress(progress: SingleResult["progress"] 
 	};
 }
 
-function rememberForegroundRun(state: SubagentState, input: { modelResponseAliases?: Record<string, string[]>; runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId: string | null; results: SingleResult[]; params: SubagentParamsLike; effectiveOutput?: string | boolean; effectiveOutputMode: OutputMode; extensionBindings?: ExtensionBindings; requiredExtensions?: SteeringRecoveryDescriptor["requiredExtensions"] }): void {
+function rememberForegroundRun(state: SubagentState, input: { modelResponseAliases?: Record<string, string[]>; runId: string; mode: "single" | "parallel" | "chain"; cwd: string; sessionId: string | null; results: SingleResult[]; params: SubagentParamsLike; effectiveExecutionLifetime?: ExecutionLifetime; effectiveOutput?: string | boolean; effectiveOutputMode: OutputMode; extensionBindings?: ExtensionBindings; requiredExtensions?: SteeringRecoveryDescriptor["requiredExtensions"] }): void {
 	state.foregroundRuns ??= new Map();
 	const previous = state.foregroundRuns.get(input.runId);
 	const updatedAt = Date.now();
@@ -775,7 +775,7 @@ function rememberForegroundRun(state: SubagentState, input: { modelResponseAlias
 		updatedAt,
 		children: input.results.map((result, index) => {
 			const resumeContract = omitUndefinedProperties({
-				executionLifetime: input.params.executionLifetime,
+				executionLifetime: input.effectiveExecutionLifetime,
 				modelResponseAliases: input.modelResponseAliases,
 				outputSchema: input.params.outputSchema,
 				agentContract: input.params.agentContract,
@@ -1941,13 +1941,13 @@ async function resumeAsyncRun(input: {
 	}
 	if (target.source === "async" && target.runner?.type === "external-job") {
 		if (attachChain) return { content: [{ type: "text", text: "External-job follow-up does not support chain attachment. Use action='resume' with message instead." }], isError: true, details: { mode: "management", results: [] } };
-		const timeout = resolveForegroundTimeout(input.params);
-		if (timeout.error) return buildRequestedModeError(input.params, timeout.error);
-		const lifetime = resolveExecutionLifetime(input.params.executionLifetime, timeout.timeoutMs);
+		const requested = resolveResumeLifetime(input.params);
+		if (requested.error) return buildRequestedModeError(input.params, requested.error);
+		const lifetime = resolveExecutionLifetime(requested.executionLifetime, requested.timeoutMs);
 		if (lifetime.error) return buildRequestedModeError(input.params, lifetime.error);
 		const resumed = await resumeExternalJobFollowUp({
-			executionLifetime: input.params.executionLifetime,
-			timeoutMs: timeout.timeoutMs,
+			executionLifetime: requested.executionLifetime,
+			timeoutMs: requested.timeoutMs,
 			requestedLifetime: input.params.executionLifetime !== undefined || input.params.timeoutMs !== undefined || input.params.maxRuntimeMs !== undefined,
 			effectiveExecutionLifetime: lifetime.effectiveExecutionLifetime!,
 			target,
@@ -1983,6 +1983,8 @@ async function resumeAsyncRun(input: {
 				details: { mode: "chain", results: [] },
 			};
 		}
+		const resumeLifetime = resolveResumeLifetime(input.params, recoveryDescriptor?.executionLifetime ?? recoveryDescriptor?.effectiveExecutionLifetime);
+		if (resumeLifetime.error) return buildRequestedModeError(input.params, resumeLifetime.error);
 		const acceptanceErrors = validateExecutionAcceptance(projectEffectiveAcceptanceSchemas(input.params, agents));
 		if (acceptanceErrors.length > 0) {
 			return { content: [{ type: "text", text: `Cannot resume: ${acceptanceErrors.join(" ")}` }], isError: true, details: { mode: "chain", results: [] } };
@@ -2047,6 +2049,8 @@ async function resumeAsyncRun(input: {
 			chainSkills: normalized === false ? [] : (normalized ?? []),
 			agentContract: input.params.agentContract,
 			fast: input.params.fast,
+			executionLifetime: resumeLifetime.executionLifetime,
+			timeoutMs: resumeLifetime.timeoutMs,
 			dynamicFanoutMaxItems: input.deps.config.chain?.dynamicFanout?.maxItems,
 			maxSubagentDepth: resolveCurrentMaxSubagentDepth(input.deps.config.maxSubagentDepth, input.deps.childRuntime),
 			waitToolEnabled: input.deps.waitToolEnabled,
@@ -2102,6 +2106,8 @@ async function resumeAsyncRun(input: {
 	const recoveryAgentConfig = recoveryDescriptor ? applySteeringRecoveryAgentConfig(baseAgentConfig, recoveryDescriptor) : baseAgentConfig;
 	const agentConfig = intercomBridge.active ? applyIntercomBridgeToAgent(recoveryAgentConfig, intercomBridge) : recoveryAgentConfig;
 	const foregroundContract = target.source === "foreground" ? target.resumeContract : undefined;
+	const resumeLifetime = resolveResumeLifetime(input.params, foregroundContract?.executionLifetime ?? recoveryDescriptor?.executionLifetime ?? recoveryDescriptor?.effectiveExecutionLifetime);
+	if (resumeLifetime.error) return buildRequestedModeError(input.params, resumeLifetime.error);
 	const outputSchema = Object.hasOwn(input.params, "outputSchema")
 		? input.params.outputSchema
 		: Object.hasOwn(foregroundContract ?? {}, "outputSchema")
@@ -2214,8 +2220,8 @@ async function resumeAsyncRun(input: {
 		...(outputSchema ? { structuredOutputSchema: outputSchema } : {}),
 		...(recoveryDescriptor?.skills ? { skills: [...recoveryDescriptor.skills] } : {}),
 		...(acceptance !== undefined ? { acceptance } : {}),
-		...(input.params.timeoutMs !== undefined ? { timeoutMs: input.params.timeoutMs } : {}),
-		executionLifetime: input.params.executionLifetime ?? foregroundContract?.executionLifetime ?? recoveryDescriptor?.executionLifetime ?? recoveryDescriptor?.effectiveExecutionLifetime,
+		...(resumeLifetime.timeoutMs !== undefined ? { timeoutMs: resumeLifetime.timeoutMs } : {}),
+		executionLifetime: resumeLifetime.executionLifetime,
 		...(input.absoluteDeadlineAt !== undefined ? { absoluteDeadlineAt: input.absoluteDeadlineAt } : {}),
 		...(input.params.toolBudget !== undefined ? { toolBudget: input.params.toolBudget } : {}),
 		// Recovery descriptors, remembered foreground runs, and current workflow roots
@@ -2896,30 +2902,23 @@ export const DEFAULT_FOREGROUND_TIMEOUT_MS = 30 * 60 * 1000;
 export { DEFAULT_ASYNC_TIMEOUT_MS };
 
 /**
- * Maximum delay a Node.js timer accepts. Values above the 32-bit signed integer
- * ceiling overflow `setTimeout`, which silently clamps the delay to ~1ms and
- * fires almost immediately — so a run configured with a larger deadline would
- * terminate right away while reporting the long duration. Any timeout destined
- * for a timer must stay within this bound.
- */
-const MAX_TIMER_DELAY_MS = 2_147_483_647;
-
-/**
  * Resolve the optional global default runtime deadline from extension config
  * (`config.timeoutMs`). Returns undefined for unset or invalid values so callers
- * fall back to the built-in defaults. "Invalid" covers non-positive-integer
- * values and values above `MAX_TIMER_DELAY_MS`; the latter would overflow the
- * Node.js timer and expire the run almost immediately instead of running long.
+ * fall back to the built-in defaults. Values above the Node.js timer ceiling
+ * would overflow and expire the run almost immediately.
  */
 export function resolveConfigDefaultTimeoutMs(raw: unknown): number | undefined {
-	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > MAX_TIMER_DELAY_MS) return undefined;
+	if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > MAX_EXECUTION_TIMEOUT_MS) return undefined;
 	return raw;
 }
 
 export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTimeoutMs?: number): { timeoutMs?: number; error?: string } {
-	if (params.executionLifetime !== undefined) return resolveExecutionLifetime(params.executionLifetime);
 	const rawTimeout = params.timeoutMs;
 	const rawMaxRuntime = params.maxRuntimeMs;
+	if (params.executionLifetime !== undefined) {
+		if (rawTimeout !== undefined || rawMaxRuntime !== undefined) return { error: "executionLifetime cannot be combined with timeoutMs or maxRuntimeMs." };
+		return resolveExecutionLifetime(params.executionLifetime);
+	}
 	if (rawTimeout === undefined && rawMaxRuntime === undefined) {
 		return defaultTimeoutMs === undefined ? {} : { timeoutMs: defaultTimeoutMs };
 	}
@@ -2934,6 +2933,17 @@ export function resolveForegroundTimeout(params: SubagentParamsLike, defaultTime
 	}
 	const timeoutMs = rawTimeout ?? rawMaxRuntime;
 	return timeoutMs === undefined ? {} : { timeoutMs };
+}
+
+function resolveResumeLifetime(params: SubagentParamsLike, inherited?: ExecutionLifetime): { executionLifetime?: ExecutionLifetime; timeoutMs?: number; error?: string } {
+	const resolved = resolveForegroundTimeout(params);
+	if (resolved.error) return { error: resolved.error };
+	const legacyRequested = params.executionLifetime === undefined && (params.timeoutMs !== undefined || params.maxRuntimeMs !== undefined);
+	const executionLifetime = params.executionLifetime ?? (legacyRequested ? undefined : inherited);
+	return {
+		...(executionLifetime ? { executionLifetime } : {}),
+		...(legacyRequested && resolved.timeoutMs !== undefined ? { timeoutMs: resolved.timeoutMs } : {}),
+	};
 }
 
 /**
@@ -4241,7 +4251,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		usageBudget: usageBudgetState(data.usageBudget, totalCost),
 		...(worktreeHandoff?.reference ? { parallelHandoff: worktreeHandoff.reference } : {}),
 	}));
-	rememberForegroundRun(deps.state, { modelResponseAliases, runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, results: details.results, params, effectiveOutput, effectiveOutputMode, extensionBindings: params.extensionBindings, requiredExtensions });
+	rememberForegroundRun(deps.state, { modelResponseAliases, runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, results: details.results, params, effectiveExecutionLifetime: details.effectiveExecutionLifetime, effectiveOutput, effectiveOutputMode, extensionBindings: params.extensionBindings, requiredExtensions });
 
 	const suppressRoutineResultIntercom = shouldSuppressRoutineResultIntercom({ suppressRoutineResultIntercom: params.suppressRoutineResultIntercom, results: [r] });
 	if (!r.detached && !r.interrupted && !suppressRoutineResultIntercom) {
