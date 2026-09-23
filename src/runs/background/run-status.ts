@@ -574,7 +574,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			const workflowChildren = parseWorkflowChildSummary(status.workflowChildren);
 			if (workflowChildren && workflowChildren.workflowRunId !== status.runId) throw new Error("workflowChildren.workflowRunId does not match async status runId.");
 			const workflowTerminalProof = workflowChildren
-				? readWorkflowTerminalProof(asyncDir, workflowChildren, validHostStepNodes(status.workflowGraph).length, status.endedAt ?? status.lastUpdate ?? status.startedAt)
+				? readWorkflowTerminalProof(asyncDir, status.steps, workflowChildren, validHostStepNodes(status.workflowGraph).length, status.endedAt ?? status.lastUpdate ?? status.startedAt)
 				: undefined;
 			const workflowChildrenByKey = new Map(workflowChildren?.children.map((child) => [child.childId, child]));
 			const lines = [

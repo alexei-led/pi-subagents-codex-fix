@@ -1507,9 +1507,13 @@ describe("async run status inspection", () => {
 				instances: [{ kind: "runner", processInstanceId: "runner-1", closeObservedAt: 300, exitCode: 0, signal: null }],
 			};
 			fs.writeFileSync(path.join(childDir, "process-terminal.json"), JSON.stringify(childProof));
+			fs.writeFileSync(path.join(childDir, "status.json"), JSON.stringify({
+				runId: "child-run", mode: "single", state: "complete", startedAt: 100, lastUpdate: 300,
+				processTerminal: { version: 1, state: "pending", runId: "child-run", runnerProcessInstanceId: "runner-1" },
+			}));
 			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
 				runId: "workflow-parent", mode: "workflow", state: "complete", startedAt: 100, lastUpdate: 200, endedAt: 250,
-				steps: [{ agent: "worker", workflowKey: "main", runId: "child-run", status: "completed" }],
+				steps: [{ agent: "worker", workflowKey: "main", runId: "child-run", async: true, status: "completed" }],
 				workflowChildren: {
 					version: 1, parentToolCallId: "tool-call", workflowRunId: "workflow-parent", inventoryComplete: true,
 					workflowState: "completed", children: [{ childId: "main", runId: "child-run", state: "completed" }],
