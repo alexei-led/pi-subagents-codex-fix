@@ -149,8 +149,9 @@ artifacts. After a lost RPC spawn reply, request `status` with
 Default targeted replies expose the resolved `runId` and retained `toolCallId`
 in `data.details`; older artifacts can omit the latter.
 
-Lookup uses the existing run indexes and retained artifacts. Correlation is not
-idempotent spawn: multiple runs with one alias are ambiguous, and missing or
+Lookup uses the existing run indexes and retained artifacts. Terminal indexing
+keeps the alias after result delivery while the run's status is retained.
+Correlation is not idempotent spawn: multiple runs with one alias are ambiguous, and missing or
 expired evidence never proves that execution did not start. Do not redispatch
 on that basis. Existing ownership checks remain unchanged.
 
