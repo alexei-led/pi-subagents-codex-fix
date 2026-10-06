@@ -7,6 +7,8 @@ import { describe, it } from "node:test";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 import { createSubagentExecutor } from "../../src/runs/foreground/subagent-executor.ts";
+import { removeResultIndex } from "../../src/runs/background/result-files.ts";
+import { readActiveRunToolCallIndex } from "../../src/runs/background/active-run-index.ts";
 import { DIRS, SUBAGENT_ASYNC_STARTED_EVENT, type AsyncStatus, type Details, type SubagentState } from "../../src/shared/types.ts";
 import { registerSubagentRpcBridge, SUBAGENT_RPC_REQUEST_EVENT, subagentRpcReplyEvent, type SubagentRpcReplyEnvelope } from "../../src/extension/rpc.ts";
 import { createEventBus, makeAgent, makeMinimalCtx } from "../support/helpers.ts";
@@ -156,7 +158,13 @@ describe("direct RPC correlation", () => {
 			await waitFor(() => status(id).processTerminal?.state === "observed");
 			assert.equal(status(id).toolCallId, toolCallId);
 			assert.equal(launched.details.toolCallId, toolCallId);
-			if (index === 0) assertIdentity(id, toolCallId);
+			if (index === 0) {
+				// Normal delivery removes the result and its alias; terminal status remains.
+				fs.unlinkSync(path.join(DIRS.results, `${id}.json`));
+				removeResultIndex(DIRS.results, status(id).sessionId, id, toolCallId);
+				assert.deepEqual(readActiveRunToolCallIndex(DIRS.async, toolCallId), []);
+				assertIdentity(id, toolCallId);
+			}
 		}
 		assert.notEqual(ids[0], ids[1], "correlation is not an idempotent-spawn promise");
 		const ambiguous = freshLookup(toolCallId);

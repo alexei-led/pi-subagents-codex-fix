@@ -5,6 +5,7 @@ import { readStatus } from "../../shared/utils.ts";
 import { findAsyncRunPrefixMatches, type AsyncRunLocation } from "./async-resume.ts";
 import { resultCandidateFilesForToolCall, resultFilePath, resultPayloadPathForIndexedRun } from "./result-files.ts";
 import { readActiveRunToolCallIndex } from "./active-run-index.ts";
+import { readTerminalRunToolCallIndex } from "./terminal-run-index.ts";
 import { assertSafeNestedId, findNestedRunMatchesById, type NestedRoute, type NestedRunMatch, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 
 export type ResolvedSubagentRunId =
@@ -66,7 +67,7 @@ function toolCallIdMatches(value: string | undefined, query: string): boolean {
 
 function indexedToolCallIdAsyncLocations(toolCallId: string, asyncDirRoot: string, resultsDir: string): AsyncRunMatch[] {
 	const byId = new Map<string, AsyncRunLocation>();
-	for (const entry of readActiveRunToolCallIndex(asyncDirRoot, toolCallId)) {
+	for (const entry of [...readActiveRunToolCallIndex(asyncDirRoot, toolCallId), ...readTerminalRunToolCallIndex(asyncDirRoot, toolCallId)]) {
 		const asyncDir = path.join(asyncDirRoot, entry);
 		const status = readStatus(asyncDir);
 		if (!status || !toolCallIdMatches(status.toolCallId, toolCallId)) continue;
