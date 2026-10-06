@@ -143,26 +143,16 @@ Structured delegation progress updates carry `runId` as soon as foreground execu
 
 ### Direct async launch correlation
 
-Direct async runs retain their originating `toolCallId` alongside the native run
-ID in launch receipts, status and result artifacts. RPC `spawn` uses
-`rpc-spawn-<requestId>` as that tool-call ID. After a lost spawn reply, the
-existing targeted status lookup can resolve that alias while its artifacts and
-indexes remain available:
+Direct async runs retain their originating `toolCallId` in status and result
+artifacts. After a lost RPC spawn reply, request `status` with
+`id: "rpc-spawn-<original-requestId>"`. The raw request UUID is not a run ID.
+Default targeted replies expose the resolved `runId` and retained `toolCallId`
+in `data.details`; older artifacts can omit the latter.
 
-```typescript
-// spawnRequestId is the requestId recorded before the original spawn request.
-const params = { id: `rpc-spawn-${spawnRequestId}` };
-// Send params with method: "status" and a new requestId for this lookup.
-```
-
-Default targeted status replies expose the resolved `runId` and retained
-`toolCallId` in `data.details`; older artifacts can omit the tool-call ID. The
-raw spawn request UUID is not itself a native run ID. Existing session ownership
-rules for controls and transcript inspection still apply.
-
-Correlation is not idempotent spawn. Multiple runs with one alias are ambiguous,
-and missing or expired artifacts cannot prove that a worker never started.
-Do not redispatch merely because a lookup is missing or ambiguous.
+Lookup uses the existing run indexes and retained artifacts. Correlation is not
+idempotent spawn: multiple runs with one alias are ambiguous, and missing or
+expired evidence never proves that execution did not start. Do not redispatch
+on that basis. Existing ownership checks remain unchanged.
 
 ### Fleet status DTO
 
