@@ -261,6 +261,8 @@ interface AsyncChainParams {
 }
 
 interface AsyncSingleParams {
+	/** Originating executor invocation, distinct from the async run id. */
+	toolCallId?: string;
 	agent: string;
 	task?: string;
 	/** Raw caller-facing goal used only by the started event. */
@@ -2191,6 +2193,7 @@ export function executeAsyncSingle(
 		spawnResultOrPromise = spawnRunner(
 			{
 				id,
+				...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 				steps: [
 					{
 						parentSessionId: launchParentSessionId,
@@ -2312,6 +2315,7 @@ export function executeAsyncSingle(
 				...(ctx.currentSessionId ? { sessionId: ctx.currentSessionId } : {}),
 				...(initialCompletionOwnerId ? { completionOwnerId: initialCompletionOwnerId } : {}),
 				mode: "single",
+				...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 				state: "running",
 				startedAt: initialStatusAt,
 				lastUpdate: initialStatusAt,
@@ -2388,6 +2392,7 @@ export function executeAsyncSingle(
 			sessionId: ctx.currentSessionId,
 			completionOwnerId: ctx.completionOwnerId ?? currentCompletionOwnerId(),
 			mode: "single",
+			...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
 			agent,
 			task: task?.trim() ? PROMPT_REDACTED : undefined,
 			goal: (params.goal ?? task).trim() ? PROMPT_REDACTED : undefined,
@@ -2407,7 +2412,7 @@ export function executeAsyncSingle(
 
 	return {
 		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`, ctx.interactive === true) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
+		details: { mode: "single", runId: id, ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}), results: [], asyncId: id, asyncDir, launchContractDigest, launchResolvedExtensions, ...(capabilityCeiling ? { capabilityCeiling } : {}), ...(params.context ? { context: params.context } : {}), ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.toolBudget ? { toolBudget: resolvedToolBudget.budget ?? params.toolBudget } : {}), ...(initialUsageBudget ? { usageBudget: initialUsageBudget } : {}) } as Details,
 	};
 	};
 	return spawnResultOrPromise instanceof Promise ? spawnResultOrPromise.then(finishSpawnResult) : finishSpawnResult(spawnResultOrPromise);
