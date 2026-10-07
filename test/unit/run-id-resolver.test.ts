@@ -268,6 +268,23 @@ describe("subagent run id resolver", () => {
 		}
 	});
 
+	it("reports an alias shared by a live run and a delivered run as ambiguous", (t) => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-terminal-alias-"));
+		t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+		const toolCallId = "rpc-spawn-original-request";
+		const retainedDir = path.join(root, "retained-run");
+		const retained: AsyncStatus = { runId: "retained-run", sessionId: "s", state: "complete", mode: "single", startedAt: 1, endedAt: 2, toolCallId };
+		fs.mkdirSync(retainedDir, { recursive: true });
+		fs.writeFileSync(path.join(retainedDir, "status.json"), JSON.stringify(retained));
+		updateTerminalRunIndex(retainedDir, retained);
+		const liveDir = path.join(root, "live-run");
+		fs.mkdirSync(liveDir, { recursive: true });
+		const state = { asyncJobs: new Map([["live-run", { asyncId: "live-run", asyncDir: liveDir, toolCallId }]]), foregroundControls: new Map() } as unknown as SubagentState;
+		const deps = { asyncDirRoot: root, resultsDir: path.join(root, "results") };
+		assert.throws(() => resolveSubagentRunId(toolCallId, { ...deps, state }), /ambiguous across async runs/);
+		assert.equal(resolveSubagentRunId(toolCallId, deps)?.id, "retained-run", "without a live run the delivered run's alias is unique");
+	});
+
 	it("cleans stale and mismatched terminal alias pointers without resolving them", (t) => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-terminal-alias-stale-"));
 		t.after(() => fs.rmSync(root, { recursive: true, force: true }));

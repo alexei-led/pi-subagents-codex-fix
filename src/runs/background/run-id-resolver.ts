@@ -152,11 +152,13 @@ export function resolveSubagentRunId(id: string, deps: ResolveSubagentRunIdDeps 
 	if (hasExactForegroundId(deps.state, id)) return { kind: "foreground", id };
 	const exactAsync = exactAsyncLocation(id, asyncDirRoot, resultsDir);
 	if (exactAsync) return { kind: "async", id, location: exactAsync };
+	// A live run and a delivered run can share one alias; count both before deciding it is unique.
+	const toolCallMatches = new Map(indexedToolCallIdAsyncLocations(id, asyncDirRoot, resultsDir).map((match) => [match.id, match]));
 	const exactLiveToolCallMatch = exactLiveAsyncToolCallMatch(deps.state, id, asyncDirRoot, resultsDir);
-	if (exactLiveToolCallMatch) return { kind: "async", id: exactLiveToolCallMatch.id, location: exactLiveToolCallMatch.location };
-	const exactToolCallIdMatches = indexedToolCallIdAsyncLocations(id, asyncDirRoot, resultsDir);
-	if (exactToolCallIdMatches.length > 1) throw new Error(`Subagent tool-call id '${id}' is ambiguous across async runs. Use the returned asyncId instead.`);
-	if (exactToolCallIdMatches[0]) return { kind: "async", id: exactToolCallIdMatches[0].id, location: exactToolCallIdMatches[0].location };
+	if (exactLiveToolCallMatch) toolCallMatches.set(exactLiveToolCallMatch.id, exactLiveToolCallMatch);
+	if (toolCallMatches.size > 1) throw new Error(`Subagent tool-call id '${id}' is ambiguous across async runs. Use the returned asyncId instead.`);
+	const [toolCallMatch] = toolCallMatches.values();
+	if (toolCallMatch) return { kind: "async", id: toolCallMatch.id, location: toolCallMatch.location };
 	const nestedScope = deps.nested ?? nestedScopeFromState(deps.state);
 	const exactNested = findNestedRunMatchesById(id, nestedScope ? { scope: nestedScope } : {});
 	if (exactNested.length > 1) throw new Error(`Nested run id '${id}' is ambiguous across authorized registries. Provide the full id after stale registries are cleaned up.`);
